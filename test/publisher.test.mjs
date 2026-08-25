@@ -120,6 +120,33 @@ describe('external Desktop publication owner', () => {
     assert.equal(fixture.store.objects.has('desktop/signed/latest.json'), false)
   })
 
+  it('accepts the repository native same-source Windows retry provenance without relabelling bytes', async () => {
+    const fixture = releaseFixture()
+    const manifest = JSON.parse(fixture.github.file('201', 'desktop-release-unsigned.json').buffer)
+    const candidate = JSON.parse(fixture.github.file('202', 'desktop-candidate.json').buffer)
+    manifest.artifacts.win32.build_run_id = '99'
+    candidate.artifacts.win32.build_run_id = '99'
+    fixture.github.replaceFile('201', 'desktop-release-unsigned.json', pretty(manifest))
+    fixture.github.replaceFile('202', 'desktop-candidate.json', pretty(candidate))
+    fixture.github.runs.set('99', {
+      ...run('99', '.github/workflows/desktop-release.yml', 'workflow_dispatch'),
+      conclusion: 'failure',
+    })
+    fixture.github.jobs.set('99', [
+      job('Build and verify the e-Mate profile'),
+      job('Build unsigned Windows x64 installer'),
+    ])
+    fixture.github.jobs.set('102', [
+      job('Validate reusable profile and Windows artifacts'),
+      job('Build unsigned macOS universal disk image'),
+      job('Bind native artifacts to the release manifest'),
+    ])
+
+    const receipt = await fixture.publish()
+    assert.equal(receipt.status, 'published')
+    assert.equal(fixture.store.objects.has('desktop/signed/latest.json'), true)
+  })
+
   it('resumes an identical partially or fully published release without overwriting immutable keys', async () => {
     const fixture = releaseFixture()
     const first = await fixture.publish()

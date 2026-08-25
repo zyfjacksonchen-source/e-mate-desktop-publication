@@ -84,22 +84,41 @@ export async function publishDesktopRelease(config, dependencies) {
 
   const provenance = unsigned.github_artifact_provenance
   const [candidateReference, performanceReference] = provenance.artifacts
-  for (const platform of ['darwin', 'win32']) {
-    if (unsigned.artifacts[platform].build_run_id !== candidateReference.run_id) {
-      throw new Error(`${platform} installer build run is not the exact candidate run`)
-    }
+  if (unsigned.artifacts.darwin.build_run_id !== candidateReference.run_id) {
+    throw new Error('macOS installer build run is not the exact candidate run')
   }
+  const reusedWindowsRunId = unsigned.artifacts.win32.build_run_id === candidateReference.run_id
+    ? undefined
+    : unsigned.artifacts.win32.build_run_id
   const candidateArtifact = await validateProvenanceArtifact(github, candidateReference, {
     path: '.github/workflows/desktop-release.yml',
     event: 'workflow_dispatch',
     sourceCommit: config.sourceCommit,
-    jobs: [
-      'Build and verify the e-Mate profile',
-      'Build unsigned Windows x64 installer',
-      'Build unsigned macOS universal disk image',
-      'Bind native artifacts to the release manifest',
-    ],
+    jobs: reusedWindowsRunId === undefined
+      ? [
+          'Build and verify the e-Mate profile',
+          'Build unsigned Windows x64 installer',
+          'Build unsigned macOS universal disk image',
+          'Bind native artifacts to the release manifest',
+        ]
+      : [
+          'Validate reusable profile and Windows artifacts',
+          'Build unsigned macOS universal disk image',
+          'Bind native artifacts to the release manifest',
+        ],
   })
+  if (reusedWindowsRunId !== undefined) {
+    await validateRun(github, reusedWindowsRunId, {
+      path: '.github/workflows/desktop-release.yml',
+      event: 'workflow_dispatch',
+      sourceCommit: config.sourceCommit,
+      requireSuccessfulRun: false,
+      jobs: [
+        'Build and verify the e-Mate profile',
+        'Build unsigned Windows x64 installer',
+      ],
+    })
+  }
   const performanceArtifact = await validateProvenanceArtifact(github, performanceReference, {
     path: '.github/workflows/desktop-performance.yml',
     event: 'workflow_dispatch',
@@ -305,7 +324,8 @@ async function validateProtectedMain(github, config) {
 async function validateRun(github, runId, expected) {
   if (!RUN_ID.test(String(runId))) throw new Error('GitHub run id is invalid')
   const run = await github.getRun(String(runId))
-  if (String(run.id) !== String(runId) || run.status !== 'completed' || run.conclusion !== 'success'
+  if (String(run.id) !== String(runId) || run.status !== 'completed'
+    || expected.requireSuccessfulRun !== false && run.conclusion !== 'success'
     || run.headSha !== expected.sourceCommit || run.headBranch !== 'main'
     || run.path !== expected.path || run.event !== expected.event
     || !Number.isSafeInteger(run.runAttempt) || run.runAttempt <= 0) {

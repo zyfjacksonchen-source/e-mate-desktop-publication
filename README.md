@@ -58,8 +58,12 @@ the e-Mate admission producer. Its two GitHub provenance rows point to:
 
 The action downloads both by artifact ID, matches the GitHub API digest, run,
 attempt, workflow, branch, source commit and required successful jobs, then
-hashes the extracted installer files again. `mac-smoke` anywhere in an input
-archive is a hard failure.
+hashes the extracted installer files again. The repository's one native
+same-source Windows/macOS retry path remains valid: the final candidate run must
+contain the successful reuse-admission, macOS and manifest jobs, while the exact
+original Windows run must contain successful Profile and Windows jobs and retain
+its original run ID in the artifact record. No other cross-run relabelling is
+accepted. `mac-smoke` anywhere in an input archive is a hard failure.
 
 The performance admission is deterministic JSON with these exact fields:
 
