@@ -101,6 +101,66 @@ the separate context `e-mate-desktop-release-manifest-v1\0` and covers the
 canonical 11-field body. The production private key must derive exactly the
 SPKI public key already present in the admitted Base contract.
 
+## Protected performance admission action
+
+The independent action entrypoint is
+`zyfjacksonchen-source/e-mate-desktop-publication/performance@<40-character-commit>`.
+It verifies and signs evidence only; it has no R2 client or publication step.
+In addition to `source-sha`, `main-ci-run-id` and `signing-key-id`, it accepts
+only the exact GitHub artifact IDs `desktop-artifact-id` and
+`evidence-artifact-id`. It never accepts a caller path or caller-reported
+artifact digest.
+
+The downloaded `e-mate-desktop-release-<sha>` artifact must contain exactly:
+
+```text
+base-contract.json
+desktop-candidate.json
+profile-component-aggregate.json
+e-Mate-2.0.13-mac-universal.dmg
+e-Mate-2.0.13-win-x64-Setup.exe
+```
+
+The Base bytes must also equal the file read independently from protected-main
+GitHub Contents. Both installer hashes and byte counts must equal the candidate;
+the generated Profile aggregate must have the existing target schema. The
+action accepts the repository's single same-source native retry contract, but
+validates both the final run and the exact original Windows run.
+
+The downloaded `e-mate-performance-evidence-<sha>` artifact must contain the
+root `e-mate-performance-evidence.json`, the exact protected-main
+`scripts/performance-parity.mjs`, and exactly the unique relative evidence files
+named by the three native run receipts. The action compares the verifier bytes
+with GitHub Contents, runs that verifier under Node 24 with a secret-free child
+environment, and accepts only `production-real-provider` evidence whose gate is
+`passed`, whose production artifacts were verified, and whose Base, target
+Profile generation, composition and installed package bytes match the build
+artifact.
+
+The returned action-owned directory is uploaded as
+`e-mate-performance-admission-<sha>`. Its exact file set is root
+`performance-admission.json`, root `e-mate-performance-evidence.json`, and the
+evidence files referenced by the run receipts—nothing else. The verifier is the
+following exact eight-field object inside the signed 11-field admission:
+
+```json
+{
+  "contract": "ttft-v2",
+  "source": "scripts/performance-parity.mjs",
+  "source_commit": "<40 lowercase hex>",
+  "source_sha256": "<64 lowercase hex>",
+  "harness_commit": "<40 lowercase hex>",
+  "evidence_filename": "e-mate-performance-evidence.json",
+  "decision_sha256": "<64 lowercase hex>",
+  "gate_status": "passed"
+}
+```
+
+`decision_sha256` is the SHA-256 of the verifier's deterministic pretty-JSON
+decision plus its final newline. The top-level `evidence_sha256` binds the exact
+root evidence bytes. Fixture, `mac-smoke`, extra-file, failed-gate and missing
+supporting-evidence artifacts fail closed.
+
 ## Secret boundary
 
 Composite actions do not declare secret inputs. The protected environment must
@@ -114,6 +174,11 @@ env:
   EMATE_R2_ACCESS_KEY_ID: ${{ secrets.ECOREX_R2_ACCESS_KEY_ID }}
   EMATE_R2_SECRET_ACCESS_KEY: ${{ secrets.ECOREX_R2_SECRET_ACCESS_KEY }}
 ```
+
+The `/performance` entrypoint receives only
+`EMATE_GITHUB_PROVENANCE_TOKEN` and
+`EMATE_DESKTOP_SIGNING_PRIVATE_KEY_PEM`; it neither requires nor reads the R2
+variables.
 
 The provenance token needs only repository Actions/Contents read plus
 Administration read for the branch-protection check. R2 credentials must be
@@ -133,7 +198,7 @@ pointer identities. Caller paths, checkout files, tags, branch-named action
 references, artifact prose, provider claims, existing mutable objects and public
 HTTP status alone are not authorities.
 
-It does not build or repair candidates, rerun performance checks, choose a Base,
+The root publication entrypoint does not build or repair candidates, rerun performance checks, choose a Base,
 rotate keys, migrate legacy clients, publish Profile desired state, update a
 website, or roll back an activated release. Losing GitHub administration-read,
 artifact digest support, public full-byte readback, conditional R2 writes or an

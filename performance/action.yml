@@ -1,0 +1,52 @@
+name: e-Mate protected performance admission
+description: Verify and sign one exact protected-main e-Mate 2.0.13 TTFT evidence artifact.
+inputs:
+  source-sha:
+    description: Exact protected-main source commit bound by CI, the Desktop build, and TTFT evidence.
+    required: true
+  main-ci-run-id:
+    description: Successful protected-main ci.yml push run containing CI admission.
+    required: true
+  desktop-artifact-id:
+    description: Exact e-mate-desktop-release artifact containing Base, Profile aggregate, and installer bytes.
+    required: true
+  evidence-artifact-id:
+    description: Exact e-mate-performance-evidence artifact containing TTFT v2 evidence and its source verifier.
+    required: true
+  signing-key-id:
+    description: Existing Ed25519 key identity in the exact admitted Base trust root.
+    required: true
+outputs:
+  artifact-path:
+    description: Action-owned directory containing only the signed admission and verified evidence.
+    value: ${{ steps.admit.outputs.artifact_path }}
+  artifact-name:
+    description: Exact e-mate-performance-admission artifact name the caller must upload.
+    value: ${{ steps.admit.outputs.artifact_name }}
+  admission-sha256:
+    description: SHA-256 of performance-admission.json.
+    value: ${{ steps.admit.outputs.admission_sha256 }}
+  evidence-sha256:
+    description: SHA-256 of e-mate-performance-evidence.json.
+    value: ${{ steps.admit.outputs.evidence_sha256 }}
+  performance-run-id:
+    description: Native performance run identity carried by the verified evidence.
+    value: ${{ steps.admit.outputs.performance_run_id }}
+runs:
+  using: composite
+  steps:
+    - id: admit
+      name: Verify exact provenance and sign the passed TTFT evidence
+      shell: bash
+      env:
+        EMATE_ACTION_REPOSITORY: ${{ github.action_repository }}
+        EMATE_ACTION_REF: ${{ github.action_ref }}
+        EMATE_SOURCE_SHA: ${{ inputs.source-sha }}
+        EMATE_MAIN_CI_RUN_ID: ${{ inputs.main-ci-run-id }}
+        EMATE_DESKTOP_ARTIFACT_ID: ${{ inputs.desktop-artifact-id }}
+        EMATE_EVIDENCE_ARTIFACT_ID: ${{ inputs.evidence-artifact-id }}
+        EMATE_SIGNING_KEY_ID: ${{ inputs.signing-key-id }}
+      run: |
+        set -euo pipefail
+        test "$(node -p 'process.versions.node.split(".")[0]')" = 24
+        node "$GITHUB_ACTION_PATH/../src/performance-main.mjs"

@@ -5,6 +5,7 @@ import {
   EXPECTED_ACTION_REPOSITORY,
   EXPECTED_REPOSITORY,
   LEGACY_TOMBSTONE,
+  PERFORMANCE_EVIDENCE_FILENAME,
   PUBLIC_ORIGIN,
   RELEASE_SIGNATURE_CONTEXT,
   bufferSource,
@@ -256,7 +257,18 @@ function releaseFixture() {
     darwin: manifestArtifact('darwin', mac, '102'),
     win32: manifestArtifact('win32', win, '102'),
   }
-  const verifier = { contract: 'ttft-v2', gate: 'passed' }
+  const evidence = publicationEvidence('performance-run-accepted-1', SOURCE)
+  const evidenceBytes = pretty(evidence)
+  const verifier = {
+    contract: 'ttft-v2',
+    source: 'scripts/performance-parity.mjs',
+    source_commit: SOURCE,
+    source_sha256: '6'.repeat(64),
+    harness_commit: SOURCE,
+    evidence_filename: PERFORMANCE_EVIDENCE_FILENAME,
+    decision_sha256: sha256(pretty(evidence.decision)),
+    gate_status: 'passed',
+  }
   const performanceUnsigned = {
     schema_version: 1,
     document_type: 'emate.performance-admission',
@@ -269,7 +281,7 @@ function releaseFixture() {
       darwin: { bytes: artifacts.darwin.bytes, sha256: artifacts.darwin.sha256 },
       win32: { bytes: artifacts.win32.bytes, sha256: artifacts.win32.sha256 },
     },
-    evidence_sha256: '6'.repeat(64),
+    evidence_sha256: sha256(evidenceBytes),
     verifier,
   }
   const performanceAdmission = signPerformanceAdmission(performanceUnsigned, privateKeyPem, KEY_ID)
@@ -365,7 +377,8 @@ function releaseFixture() {
       }),
       artifact('203', `e-mate-performance-admission-${SOURCE}`, '103', performanceBundleSha, {
         'performance-admission.json': performanceBytes,
-        'evidence/receipt.json': Buffer.from('{}'),
+        [PERFORMANCE_EVIDENCE_FILENAME]: evidenceBytes,
+        ...Object.fromEntries(publicationEvidencePaths(evidence).map(path => [path, Buffer.from('{}')])),
       }),
     ],
   })
@@ -392,6 +405,42 @@ function releaseFixture() {
     config,
     publish: () => publishDesktopRelease(config, { github, store, publicReader: store.publicReader }),
   }
+}
+
+function publicationEvidence(performanceRunId, harnessCommit) {
+  const path = (name, candidate) => ({
+    run_receipt: Object.fromEntries([
+      ['raw_samples_artifact', 'raw-samples'],
+      ['native_trace_artifact', 'native-session-trace'],
+      ['provider_receipt_artifact', 'provider-invocation-receipt'],
+      ['request_header_artifact', 'request-headers'],
+      ['renderer_paint_artifact', 'renderer-paint-trace'],
+      ['installed_runtime_artifact', 'installed-runtime-receipt'],
+      ...(candidate ? [['enterprise_receipt_artifact', 'enterprise-runtime-receipt']] : []),
+    ].map(([field, kind]) => [field, {
+      kind,
+      path: `evidence/${name}/${field}.json`,
+      sha256: 'd'.repeat(64),
+    }])),
+  })
+  return {
+    schema_version: 2,
+    comparison_kind: 'installed-2.0.12-vs-2.0.13',
+    performance_run_id: performanceRunId,
+    evidence_kind: 'production-real-provider',
+    harness_commit: harnessCommit,
+    paths: {
+      baseline: path('baseline', false),
+      emate_online: path('emate_online', true),
+      emate_enterprise_unavailable_valid_cache: path('emate_enterprise_unavailable_valid_cache', true),
+    },
+    production_artifacts_verified: true,
+    decision: { gate_status: 'passed', failures: [], production_receipt_failures: [], comparisons: {} },
+  }
+}
+
+function publicationEvidencePaths(evidence) {
+  return Object.values(evidence.paths).flatMap(path => Object.values(path.run_receipt).map(value => value.path))
 }
 
 class FakeGithub {

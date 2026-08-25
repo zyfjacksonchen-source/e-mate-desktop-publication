@@ -13,6 +13,9 @@ export const EXPECTED_R2_BUCKET = 'emate-desktop-downloads'
 export const RELEASE_VERSION = '2.0.13'
 export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-manifest-v1\0', 'utf8')
 export const PERFORMANCE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-admission-v1\0', 'utf8')
+export const PERFORMANCE_EVIDENCE_FILENAME = 'e-mate-performance-evidence.json'
+export const PERFORMANCE_VERIFIER_SOURCE = 'scripts/performance-parity.mjs'
+export const MAX_PERFORMANCE_FILE_BYTES = 64 * 1024 * 1024
 export const LEGACY_TOMBSTONE = Object.freeze({
   key: 'desktop/latest.json',
   bytes: 948,
@@ -44,6 +47,199 @@ const MAX_JSON_BYTES = 64 * 1024
 const IMMUTABLE_CACHE = 'public,max-age=31536000,immutable'
 const JSON_CONTENT_TYPE = 'application/json'
 const BINARY_CONTENT_TYPE = 'application/octet-stream'
+const PERFORMANCE_PATHS = ['baseline', 'emate_online', 'emate_enterprise_unavailable_valid_cache']
+const PERFORMANCE_ARTIFACT_FIELDS = [
+  ['raw_samples_artifact', 'raw-samples'],
+  ['native_trace_artifact', 'native-session-trace'],
+  ['provider_receipt_artifact', 'provider-invocation-receipt'],
+  ['request_header_artifact', 'request-headers'],
+  ['renderer_paint_artifact', 'renderer-paint-trace'],
+  ['installed_runtime_artifact', 'installed-runtime-receipt'],
+]
+
+export async function createPerformanceAdmission(config, dependencies) {
+  validatePerformanceInvocation(config)
+  const { github, verifyPerformance } = dependencies
+
+  await validateProtectedMain(github, config)
+  await validateRun(github, config.mainCiRunId, {
+    path: '.github/workflows/ci.yml',
+    event: 'push',
+    sourceCommit: config.sourceCommit,
+    jobs: ['CI admission'],
+  })
+
+  const desktopArtifact = await github.getArtifact(config.desktopArtifactId)
+  assertArtifactMetadata(desktopArtifact, {
+    id: config.desktopArtifactId,
+    name: `e-mate-desktop-release-${config.sourceCommit}`,
+  })
+  const desktopBundle = await github.downloadArtifact(config.desktopArtifactId)
+  assertDownloadedArtifact(desktopBundle, desktopArtifact)
+  assertNoMacSmoke(desktopBundle.files)
+  const artifactNames = {
+    darwin: `e-Mate-${RELEASE_VERSION}-mac-universal.dmg`,
+    win32: `e-Mate-${RELEASE_VERSION}-win-x64-Setup.exe`,
+  }
+  assertExactFileSet(desktopBundle.files, [
+    'base-contract.json',
+    'desktop-candidate.json',
+    'profile-component-aggregate.json',
+    artifactNames.darwin,
+    artifactNames.win32,
+  ])
+  const candidate = parsePrettyJson(
+    await readSmall(requiredFile(desktopBundle.files, 'desktop-candidate.json')),
+    'Desktop artifact candidate',
+  )
+  const baseBytes = await readSmall(requiredFile(desktopBundle.files, 'base-contract.json'))
+  const base = parseJson(baseBytes, 'Desktop Base contract')
+  const profileComponentAggregate = parsePrettyJson(
+    await readSmall(requiredFile(desktopBundle.files, 'profile-component-aggregate.json')),
+    'Profile component aggregate',
+  )
+  validatePerformanceCandidate(candidate, config.sourceCommit, base)
+  if (!profileAggregate(profileComponentAggregate)) throw new Error('Profile component aggregate is invalid')
+
+  const trustedBaseBytes = await github.getFile('desktop/e-mate-desktop/base-contract.json', config.sourceCommit)
+  if (!Buffer.isBuffer(trustedBaseBytes) || !baseBytes.equals(trustedBaseBytes)) {
+    throw new Error('Desktop Base contract is not the exact protected-main source file')
+  }
+  validateBaseAndSigningKey(base, {
+    baseContractId: base.id,
+    scheduleProtocolFloor: candidate.schedule_protocol_floor,
+    signatureKeyId: config.signingKeyId,
+  }, config)
+
+  if (String(candidate.artifacts.darwin.build_run_id) !== String(desktopArtifact.runId)) {
+    throw new Error('macOS installer build run is not the exact candidate run')
+  }
+  const reusedWindowsRunId = String(candidate.artifacts.win32.build_run_id) === String(desktopArtifact.runId)
+    ? undefined
+    : String(candidate.artifacts.win32.build_run_id)
+  await validateRun(github, desktopArtifact.runId, {
+    path: '.github/workflows/desktop-release.yml',
+    event: 'workflow_dispatch',
+    sourceCommit: config.sourceCommit,
+    jobs: reusedWindowsRunId === undefined
+      ? [
+          'Build and verify the e-Mate profile',
+          'Build unsigned Windows x64 installer',
+          'Build unsigned macOS universal disk image',
+          'Bind native artifacts to the release manifest',
+        ]
+      : [
+          'Validate reusable profile and Windows artifacts',
+          'Build unsigned macOS universal disk image',
+          'Bind native artifacts to the release manifest',
+        ],
+  })
+  if (reusedWindowsRunId !== undefined) {
+    await validateRun(github, reusedWindowsRunId, {
+      path: '.github/workflows/desktop-release.yml',
+      event: 'workflow_dispatch',
+      sourceCommit: config.sourceCommit,
+      requireSuccessfulRun: false,
+      jobs: ['Build and verify the e-Mate profile', 'Build unsigned Windows x64 installer'],
+    })
+  }
+
+  for (const platform of ['darwin', 'win32']) {
+    const source = requiredFile(desktopBundle.files, artifactNames[platform])
+    const expected = candidate.artifacts[platform]
+    if (source.bytes !== expected.bytes || await source.digest() !== expected.sha256) {
+      throw new Error(`GitHub ${platform} installer bytes do not match the performance candidate`)
+    }
+  }
+
+  const evidenceArtifact = await github.getArtifact(config.evidenceArtifactId)
+  assertArtifactMetadata(evidenceArtifact, {
+    id: config.evidenceArtifactId,
+    name: `e-mate-performance-evidence-${config.sourceCommit}`,
+  })
+  await validateRun(github, evidenceArtifact.runId, {
+    path: '.github/workflows/desktop-performance.yml',
+    event: 'workflow_dispatch',
+    sourceCommit: config.sourceCommit,
+    jobs: ['TTFT evidence'],
+  })
+  const evidenceBundle = await github.downloadArtifact(config.evidenceArtifactId)
+  assertDownloadedArtifact(evidenceBundle, evidenceArtifact)
+  assertNoMacSmoke(evidenceBundle.files)
+  const inputEvidenceBytes = await readPerformanceFile(requiredFile(
+    evidenceBundle.files,
+    PERFORMANCE_EVIDENCE_FILENAME,
+  ))
+  const inputEvidence = parsePrettyJson(inputEvidenceBytes, 'performance evidence')
+  const expectedEvidenceFiles = performanceEvidenceFiles(inputEvidence)
+  assertExactFileSet(evidenceBundle.files, [PERFORMANCE_VERIFIER_SOURCE, ...expectedEvidenceFiles])
+
+  const verifierSource = requiredFile(evidenceBundle.files, PERFORMANCE_VERIFIER_SOURCE)
+  const verifierBytes = await readPerformanceFile(verifierSource)
+  const trustedVerifierBytes = await github.getFile(PERFORMANCE_VERIFIER_SOURCE, config.sourceCommit)
+  if (!Buffer.isBuffer(trustedVerifierBytes) || !verifierBytes.equals(trustedVerifierBytes)) {
+    throw new Error('performance verifier is not the exact protected-main source file')
+  }
+  const evidenceBytes = Buffer.from(await verifyPerformance(evidenceBundle))
+  if (evidenceBytes.byteLength <= 0 || evidenceBytes.byteLength > MAX_PERFORMANCE_FILE_BYTES) {
+    throw new Error('verified performance evidence is empty or oversized')
+  }
+  const evidence = parsePrettyJson(evidenceBytes, 'verified performance evidence')
+  if (canonicalJson(performanceEvidenceFiles(evidence)) !== canonicalJson(expectedEvidenceFiles)) {
+    throw new Error('verified performance evidence changed its artifact file set')
+  }
+  validateVerifiedPerformanceEvidence(
+    evidence,
+    inputEvidence,
+    config.sourceCommit,
+    base,
+    profileComponentAggregate,
+    candidate,
+  )
+
+  const verifier = {
+    contract: 'ttft-v2',
+    source: PERFORMANCE_VERIFIER_SOURCE,
+    source_commit: config.sourceCommit,
+    source_sha256: sha256(verifierBytes),
+    harness_commit: evidence.harness_commit,
+    evidence_filename: PERFORMANCE_EVIDENCE_FILENAME,
+    decision_sha256: sha256(Buffer.from(`${JSON.stringify(evidence.decision, null, 2)}\n`, 'utf8')),
+    gate_status: 'passed',
+  }
+  const unsigned = {
+    schema_version: 1,
+    document_type: 'emate.performance-admission',
+    status: 'passed',
+    performance_run_id: evidence.performance_run_id,
+    source_commit: config.sourceCommit,
+    base_contract_id: base.id,
+    profile_component_aggregate_sha256: profileComponentAggregate.aggregate_sha256,
+    desktop_artifacts: Object.fromEntries(['darwin', 'win32'].map(platform => [platform, {
+      bytes: candidate.artifacts[platform].bytes,
+      sha256: candidate.artifacts[platform].sha256,
+    }])),
+    evidence_sha256: sha256(evidenceBytes),
+    verifier,
+  }
+  const admission = signPerformanceAdmission(unsigned, config.privateKeyPem, config.signingKeyId)
+  const admissionBytes = Buffer.from(`${JSON.stringify(admission, null, 2)}\n`)
+  const outputFiles = new Map([
+    ['performance-admission.json', bufferSource(admissionBytes)],
+    [PERFORMANCE_EVIDENCE_FILENAME, bufferSource(evidenceBytes)],
+  ])
+  for (const path of expectedEvidenceFiles) {
+    if (path !== PERFORMANCE_EVIDENCE_FILENAME) outputFiles.set(path, requiredFile(evidenceBundle.files, path))
+  }
+  assertExactFileSet(outputFiles, ['performance-admission.json', ...expectedEvidenceFiles])
+  return {
+    artifactName: `e-mate-performance-admission-${config.sourceCommit}`,
+    files: outputFiles,
+    performanceRunId: evidence.performance_run_id,
+    admissionSha256: sha256(admissionBytes),
+    evidenceSha256: unsigned.evidence_sha256,
+  }
+}
 
 export async function publishDesktopRelease(config, dependencies) {
   validateInvocation(config)
@@ -80,7 +276,11 @@ export async function publishDesktopRelease(config, dependencies) {
   const unsigned = parsePrettyJson(unsignedBytes, 'unsigned Desktop manifest')
   const base = parseJson(baseBytes, 'Desktop Base contract')
   validateUnsignedManifest(unsigned, config.sourceCommit)
-  const signing = validateBaseAndSigningKey(base, unsigned, config)
+  const signing = validateBaseAndSigningKey(base, {
+    baseContractId: unsigned.base_contract_id,
+    scheduleProtocolFloor: unsigned.schedule_protocol_floor,
+    signatureKeyId: unsigned.performance.signature_key_id,
+  }, config)
 
   const provenance = unsigned.github_artifact_provenance
   const [candidateReference, performanceReference] = provenance.artifacts
@@ -157,15 +357,24 @@ export async function publishDesktopRelease(config, dependencies) {
   const performanceBundle = await github.downloadArtifact(performanceReference.artifact_id)
   assertDownloadedArtifact(performanceBundle, performanceArtifact)
   assertNoMacSmoke(performanceBundle.files)
-  const performanceAdmissionSource = uniqueBasenameFile(performanceBundle.files, 'performance-admission.json')
+  const evidenceSource = requiredFile(performanceBundle.files, PERFORMANCE_EVIDENCE_FILENAME)
+  const evidenceBytes = await readPerformanceFile(evidenceSource)
+  const evidence = parsePrettyJson(evidenceBytes, 'performance evidence')
+  assertExactFileSet(performanceBundle.files, [
+    'performance-admission.json',
+    ...performanceEvidenceFiles(evidence),
+  ])
+  const performanceAdmissionSource = requiredFile(performanceBundle.files, 'performance-admission.json')
   const performanceAdmissionBytes = await readSmall(performanceAdmissionSource)
+  const performanceAdmission = parsePrettyJson(performanceAdmissionBytes, 'performance admission')
   validatePerformanceAdmission(
-    parsePrettyJson(performanceAdmissionBytes, 'performance admission'),
+    performanceAdmission,
     performanceAdmissionBytes,
     unsigned,
     signing.publicKey,
     config.signingKeyId,
   )
+  validateAdmittedPerformanceEvidence(evidence, evidenceBytes, performanceAdmission)
 
   const signatureValue = sign(
     null,
@@ -310,6 +519,26 @@ function validateInvocation(config) {
   }
 }
 
+function validatePerformanceInvocation(config) {
+  if (process.versions.node.split('.')[0] !== '24') throw new Error('performance admission requires Node 24')
+  if (config.repository !== EXPECTED_REPOSITORY) throw new Error('unexpected caller repository')
+  if (config.actionRepository !== EXPECTED_ACTION_REPOSITORY || !SHA40.test(config.actionRef)) {
+    throw new Error('external action must be referenced by an exact reviewed commit')
+  }
+  if (config.ref !== 'refs/heads/main' || config.refProtected !== true || config.eventName !== 'workflow_dispatch') {
+    throw new Error('performance admission must run from a protected main workflow_dispatch')
+  }
+  if (!SHA40.test(config.sourceCommit) || config.githubSha !== config.sourceCommit) {
+    throw new Error('caller source commit is invalid or does not match GITHUB_SHA')
+  }
+  if (![config.mainCiRunId, config.desktopArtifactId, config.evidenceArtifactId].every(value => RUN_ID.test(value ?? ''))) {
+    throw new Error('performance admission GitHub identity is invalid')
+  }
+  if (typeof config.signingKeyId !== 'string' || config.signingKeyId === '') {
+    throw new Error('Desktop signing key id is missing')
+  }
+}
+
 async function validateProtectedMain(github, config) {
   const repository = await github.getRepository()
   if (repository.fullName !== EXPECTED_REPOSITORY || repository.visibility !== 'public'
@@ -420,13 +649,27 @@ function validateCandidate(candidate, manifest) {
   }
 }
 
-function validateBaseAndSigningKey(base, manifest, config) {
+function validatePerformanceCandidate(candidate, sourceCommit, base) {
+  if (!hasExactKeys(candidate, [
+    'schema_version', 'document_type', 'release_status', 'version', 'source_commit',
+    'schedule_protocol_floor', 'artifacts',
+  ]) || candidate.schema_version !== 1 || candidate.document_type !== 'emate.desktop-artifact-candidate'
+    || candidate.release_status !== 'performance-pending' || candidate.version !== RELEASE_VERSION
+    || candidate.source_commit !== sourceCommit || !positiveInteger(candidate.schedule_protocol_floor)
+    || candidate.schedule_protocol_floor !== base.schedule_protocol_floor
+    || !hasExactKeys(candidate.artifacts, ['darwin', 'win32'])) {
+    throw new Error('performance-pending candidate identity is invalid')
+  }
+  for (const platform of ['darwin', 'win32']) validateArtifactRecord(platform, candidate.artifacts[platform], candidate)
+}
+
+function validateBaseAndSigningKey(base, expected, config) {
   if (!hasExactKeys(base, [
     'schema_version', 'id', 'desktop_api', 'profile_format', 'desktop_reference',
     'schedule_protocol_floor', 'harness_version', 'harness_commit', 'runtime_imports', 'profile_signing_keys',
-  ]) || base.schema_version !== 1 || base.id !== manifest.base_contract_id
+  ]) || base.schema_version !== 1 || base.id !== expected.baseContractId
     || !BASE_ID.test(base.id) || !positiveInteger(base.desktop_api) || !positiveInteger(base.profile_format)
-    || base.schedule_protocol_floor !== manifest.schedule_protocol_floor
+    || base.schedule_protocol_floor !== expected.scheduleProtocolFloor
     || typeof base.harness_version !== 'string' || !VERSION.test(base.harness_version)
     || !SHA40.test(base.harness_commit ?? '')
     || !hasExactKeys(base.desktop_reference, [
@@ -476,7 +719,7 @@ function validateBaseAndSigningKey(base, manifest, config) {
   const trustedDer = strictBase64(trusted?.public_key_spki_der_base64)
   if (!hasExactKeys(trusted, ['id', 'algorithm', 'public_key_spki_der_base64'])
     || trusted.algorithm !== 'ed25519' || trustedDer === undefined
-    || !publicDer.equals(trustedDer) || manifest.performance.signature_key_id !== config.signingKeyId) {
+    || !publicDer.equals(trustedDer) || expected.signatureKeyId !== config.signingKeyId) {
     throw new Error('Desktop signing key is not the exact Base trust key')
   }
   return { privateKey, publicKey: createPublicKey(privateKey) }
@@ -494,6 +737,7 @@ function validatePerformanceAdmission(admission, rawBytes, manifest, publicKey, 
     || admission.source_commit !== manifest.source_commit || admission.base_contract_id !== manifest.base_contract_id
     || admission.profile_component_aggregate_sha256 !== manifest.profile_component_aggregate.aggregate_sha256
     || !SHA256.test(admission.evidence_sha256 ?? '')
+    || !performanceVerifier(admission.verifier, admission.source_commit)
     || canonicalJson(admission.verifier) !== canonicalJson(manifest.performance.verifier)
     || !hasExactKeys(admission.desktop_artifacts, ['darwin', 'win32'])
     || sha256(rawBytes) !== manifest.performance.admission_sha256
@@ -534,7 +778,96 @@ function performanceSummary(value) {
   return hasExactKeys(value, ['performance_run_id', 'admission_sha256', 'signature_key_id', 'verifier'])
     && typeof value.performance_run_id === 'string' && value.performance_run_id.length >= 16
     && SHA256.test(value.admission_sha256 ?? '') && typeof value.signature_key_id === 'string'
-    && value.signature_key_id.length > 0 && isRecord(value.verifier)
+    && value.signature_key_id.length > 0 && performanceVerifier(value.verifier)
+}
+
+function performanceVerifier(value, sourceCommit) {
+  return hasExactKeys(value, [
+    'contract', 'source', 'source_commit', 'source_sha256', 'harness_commit',
+    'evidence_filename', 'decision_sha256', 'gate_status',
+  ]) && value.contract === 'ttft-v2' && value.source === PERFORMANCE_VERIFIER_SOURCE
+    && (sourceCommit === undefined ? SHA40.test(value.source_commit ?? '') : value.source_commit === sourceCommit)
+    && SHA256.test(value.source_sha256 ?? '') && SHA40.test(value.harness_commit ?? '')
+    && value.evidence_filename === PERFORMANCE_EVIDENCE_FILENAME
+    && SHA256.test(value.decision_sha256 ?? '') && value.gate_status === 'passed'
+}
+
+function performanceEvidenceFiles(evidence) {
+  if (!isRecord(evidence.paths) || !hasExactKeys(evidence.paths, PERFORMANCE_PATHS)) {
+    throw new Error('performance evidence path set is invalid')
+  }
+  const files = [PERFORMANCE_EVIDENCE_FILENAME]
+  const seen = new Set(files)
+  for (const pathName of PERFORMANCE_PATHS) {
+    const receipt = evidence.paths[pathName]?.run_receipt
+    if (!isRecord(receipt)) throw new Error(`performance evidence ${pathName} receipt is missing`)
+    const fields = pathName === 'baseline'
+      ? PERFORMANCE_ARTIFACT_FIELDS
+      : [...PERFORMANCE_ARTIFACT_FIELDS, ['enterprise_receipt_artifact', 'enterprise-runtime-receipt']]
+    for (const [field, kind] of fields) {
+      const descriptor = receipt[field]
+      if (!hasExactKeys(descriptor, ['kind', 'path', 'sha256']) || descriptor.kind !== kind
+        || !safeArtifactPath(descriptor.path) || !SHA256.test(descriptor.sha256 ?? '')
+        || descriptor.path === PERFORMANCE_EVIDENCE_FILENAME
+        || descriptor.path === PERFORMANCE_VERIFIER_SOURCE
+        || descriptor.path === 'performance-admission.json'
+        || seen.has(descriptor.path)) {
+        throw new Error(`performance evidence ${field} descriptor is invalid`)
+      }
+      seen.add(descriptor.path)
+      files.push(descriptor.path)
+    }
+  }
+  return files.sort()
+}
+
+function safeArtifactPath(value) {
+  return typeof value === 'string' && value !== '' && !value.startsWith('/') && !value.endsWith('/')
+    && !value.includes('\\') && value.split('/').every(part => part !== '' && part !== '.' && part !== '..')
+}
+
+function validateVerifiedPerformanceEvidence(evidence, input, sourceCommit, base, aggregate, candidate) {
+  if (evidence.evidence_kind !== 'production-real-provider'
+    || evidence.production_artifacts_verified !== true
+    || evidence.performance_run_id !== input.performance_run_id
+    || typeof evidence.performance_run_id !== 'string' || evidence.performance_run_id.length < 16
+    || evidence.harness_commit !== base.harness_commit
+    || evidence.decision?.gate_status !== 'passed'
+    || !Array.isArray(evidence.decision.failures) || evidence.decision.failures.length !== 0
+    || !Array.isArray(evidence.decision.production_receipt_failures)
+    || evidence.decision.production_receipt_failures.length !== 0) {
+    throw new Error('performance-parity did not produce passed production evidence')
+  }
+  for (const pathName of PERFORMANCE_PATHS.slice(1)) {
+    const receipt = evidence.paths[pathName]?.run_receipt
+    const runtime = receipt?.runtime
+    const install = receipt?.install_receipt
+    const target = aggregate.targets.find(item => item.target === install?.target)
+    const platform = install?.target === 'win32-x64' ? 'win32' : 'darwin'
+    const artifact = candidate.artifacts[platform]
+    if (target === undefined || runtime?.source_commit !== sourceCommit
+      || runtime?.base_contract_id !== base.id
+      || runtime?.profile_generation !== target.profile_generation
+      || runtime?.composition_sha256 !== target.component_aggregate_sha256
+      || runtime?.desktop_artifact_sha256 !== artifact.sha256
+      || runtime?.desktop_artifact_bytes !== artifact.bytes
+      || install?.package_sha256 !== artifact.sha256 || install?.package_bytes !== artifact.bytes) {
+      throw new Error(`performance evidence ${pathName} does not bind the admitted Base/Profile/install bytes`)
+    }
+  }
+}
+
+function validateAdmittedPerformanceEvidence(evidence, evidenceBytes, admission) {
+  if (sha256(evidenceBytes) !== admission.evidence_sha256
+    || evidence.performance_run_id !== admission.performance_run_id
+    || evidence.evidence_kind !== 'production-real-provider'
+    || evidence.production_artifacts_verified !== true
+    || evidence.harness_commit !== admission.verifier.harness_commit
+    || evidence.decision?.gate_status !== 'passed'
+    || sha256(Buffer.from(`${JSON.stringify(evidence.decision, null, 2)}\n`, 'utf8'))
+      !== admission.verifier.decision_sha256) {
+    throw new Error('performance evidence does not match the signed admission')
+  }
 }
 
 function githubProvenance(value, sourceCommit) {
@@ -674,12 +1007,6 @@ function requiredFile(files, name) {
   return source
 }
 
-function uniqueBasenameFile(files, name) {
-  const matches = [...files].filter(([path]) => path.split('/').at(-1) === name)
-  if (matches.length !== 1) throw new Error(`GitHub artifact must contain exactly one ${name}`)
-  return matches[0][1]
-}
-
 function assertExactFileSet(files, expected) {
   const actual = [...files.keys()].sort()
   const wanted = [...expected].sort()
@@ -695,6 +1022,13 @@ function assertNoMacSmoke(files) {
 async function readSmall(source) {
   if (source.bytes <= 0 || source.bytes > MAX_JSON_BYTES) throw new Error('release JSON is empty or oversized')
   return source.read(MAX_JSON_BYTES)
+}
+
+async function readPerformanceFile(source) {
+  if (source.bytes <= 0 || source.bytes > MAX_PERFORMANCE_FILE_BYTES) {
+    throw new Error('performance file is empty or oversized')
+  }
+  return source.read(MAX_PERFORMANCE_FILE_BYTES)
 }
 
 function parsePrettyJson(bytes, name) {

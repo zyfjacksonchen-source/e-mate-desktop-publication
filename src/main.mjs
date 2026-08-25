@@ -166,6 +166,21 @@ export class GithubClient {
     }
   }
 
+  async getFile(path, ref) {
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/')
+    const value = await this.#json(`/repos/${this.#repository}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`)
+    if (value?.type !== 'file' || value.encoding !== 'base64' || typeof value.content !== 'string'
+      || !Number.isSafeInteger(value.size) || value.size <= 0 || value.size > MAX_API_BYTES) {
+      throw new Error('GitHub protected-main source file is invalid')
+    }
+    const encoded = value.content.replace(/\s+/gu, '')
+    const bytes = Buffer.from(encoded, 'base64')
+    if (bytes.byteLength !== value.size || bytes.toString('base64') !== encoded) {
+      throw new Error('GitHub protected-main source file encoding is invalid')
+    }
+    return bytes
+  }
+
   async downloadArtifact(artifactId) {
     const root = await mkdtemp(join(this.#temporaryRoot, 'e-mate-desktop-artifact-'))
     this.#roots.push(root)
