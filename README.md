@@ -73,9 +73,11 @@ cache_control
 ```
 
 This single-file, compression-level-0 staging shape lets the connected
-Cloudflare plugin use an action-time range-stream Worker for installers larger
-than the direct object API limit. This repository does not deploy that Worker,
-obtain a GitHub download redirect, or upload any bytes.
+Cloudflare plugin use the reviewed short-lived range-stream Worker under
+`worker/` for installers larger than the direct object API limit. Neither
+composite action deploys that Worker, obtains a GitHub download redirect, or
+uploads any bytes; deployment and invocation remain an explicit connected
+Cloudflare plugin operation.
 
 ### Three-file output
 
