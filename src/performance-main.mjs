@@ -10,7 +10,7 @@ import {
   MAX_PERFORMANCE_FILE_BYTES,
   PERFORMANCE_EVIDENCE_FILENAME,
   PERFORMANCE_VERIFIER_SOURCE,
-  createPerformanceAdmission,
+  createPerformanceAggregateAdmission,
 } from './publisher.mjs'
 
 async function main() {
@@ -22,7 +22,7 @@ async function main() {
   })
   let outputRoot
   try {
-    const result = await createPerformanceAdmission({
+    const result = await createPerformanceAggregateAdmission({
       repository: requiredEnv('GITHUB_REPOSITORY'),
       actionRepository: requiredEnv('EMATE_ACTION_REPOSITORY'),
       actionRef: requiredEnv('EMATE_ACTION_REF'),
@@ -37,7 +37,12 @@ async function main() {
       desktopArtifactId: requiredEnv('EMATE_DESKTOP_ARTIFACT_ID'),
       profileReleaseRunId: requiredEnv('EMATE_PROFILE_RELEASE_RUN_ID'),
       profileReleaseArtifactId: requiredEnv('EMATE_PROFILE_RELEASE_ARTIFACT_ID'),
-      evidenceArtifactId: requiredEnv('EMATE_EVIDENCE_ARTIFACT_ID'),
+      evidenceArtifactIds: [
+        requiredEnv('EMATE_LUNA_EVIDENCE_ARTIFACT_ID'),
+        requiredEnv('EMATE_SOL_EVIDENCE_ARTIFACT_ID'),
+        requiredEnv('EMATE_DEEPSEEK_EVIDENCE_ARTIFACT_ID'),
+        requiredEnv('EMATE_DOUBAO_EVIDENCE_ARTIFACT_ID'),
+      ],
       signingKeyId: requiredEnv('EMATE_SIGNING_KEY_ID'),
       privateKeyPem: requiredEnv('EMATE_DESKTOP_SIGNING_PRIVATE_KEY_PEM'),
     }, {

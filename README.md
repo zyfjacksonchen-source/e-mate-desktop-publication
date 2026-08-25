@@ -2,7 +2,7 @@
 
 This repository has two exact-commit composite actions:
 
-- `/performance` verifies real installed TTFT evidence and signs the performance admission.
+- `/performance` verifies four real installed TTFT v2 evidence leaves and signs one performance aggregate admission.
 - `/` verifies the final protected-main admission, signs the Desktop manifest, and emits a byte-bound publication plan for the connected Codex Cloudflare plugin.
 
 Neither action can read or write production Cloudflare R2 state. The root action
@@ -128,10 +128,18 @@ zyfjacksonchen-source/e-mate-desktop-publication/performance@<40-character-commi
 ```
 
 It accepts exact IDs for the protected-main CI run, final three-file Desktop
-artifact, Profile release run/artifact, current-run evidence artifact, and Base
-signing key. It accepts no caller filesystem path.
+artifact, Profile release run/artifact, four named current-run evidence
+artifacts, and Base signing key. It accepts no caller filesystem path. The
+ordered roster is fixed to:
 
-The downloaded performance evidence artifact must contain root
+1. `ecorex-chat` / `e-mate-enterprise` / `gpt-5.6-luna` / `max`
+2. `ecorex-gpt-5.6-sol` / `e-mate-enterprise` / `gpt-5.6-sol` / `medium`
+3. `ecorex-deepseek-v4-pro` / `e-mate-enterprise-deepseek` / `deepseek-v4-flash` / `max`
+4. `ecorex-doubao-seed-2.0-pro` / `e-mate-enterprise-doubao` / `doubao-seed-2-0-pro-260215` / `medium`
+
+Each downloaded evidence artifact is named
+`e-mate-performance-evidence-<leaf-id>-<sha>-attempt-1`, where the ordered leaf
+IDs are `luna`, `sol`, `deepseek`, and `doubao`, and must contain root
 `e-mate-performance-evidence.json`, exact protected-main
 `scripts/performance-parity.mjs`, `profile-component-aggregate.json`, and exactly
 the unique evidence files referenced by the native run receipts. The signer:
@@ -145,10 +153,23 @@ the unique evidence files referenced by the native run receipts. The signer:
 The current performance workflow may be `in_progress` only while its already
 successful `TTFT evidence` job is being signed. A completed prior run, another
 run, fixture evidence, `mac-smoke`, an extra file, or an old attempt is rejected.
-The output is `e-mate-performance-admission-<sha>-attempt-1`.
+Missing, repeated, reordered, extra, or failed leaves are rejected. The output
+is `e-mate-performance-admission-<sha>-attempt-1`, containing root
+`performance-admission.json` plus four closed `children/01-luna/` through
+`children/04-doubao/` trees.
+Each child keeps the existing `e-mate-performance-admission-v1\0` signature and
+TTFT v2 verifier contract. The outer document type is
+`emate.performance-aggregate-admission`; its
+`e-mate-performance-aggregate-admission-v1\0` signature binds the frozen
+roster and every child run identity, verifier, evidence SHA, and admission SHA.
+Desktop publication verifies the outer signature and all four leaf signatures
+before signing, while the Desktop manifest `performance` object remains the
+same four fields: `performance_run_id`, `admission_sha256`,
+`signature_key_id`, and `verifier`.
 
-Its signature context is `e-mate-performance-admission-v1\0`. The performance
-action behavior is independent of the root publication-plan handoff.
+The performance action behavior is independent of the root publication-plan
+handoff. One reviewed 40-character action commit therefore owns both aggregate
+admission and the corresponding Desktop publication verification.
 
 ## Secret boundary
 

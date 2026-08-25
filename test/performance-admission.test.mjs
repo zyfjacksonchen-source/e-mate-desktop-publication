@@ -9,12 +9,16 @@ import {
   EXPECTED_REPOSITORY,
   DESKTOP_RELEASE_ARTIFACT_FILES,
   PERFORMANCE_EVIDENCE_FILENAME,
+  PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT,
+  PERFORMANCE_MODEL_LEAF_IDS,
+  PERFORMANCE_MODEL_ROSTER,
   PERFORMANCE_SIGNATURE_CONTEXT,
   PERFORMANCE_VERIFIER_SOURCE,
   PROFILE_COMPONENT_AGGREGATE_FILENAME,
   PUBLIC_ORIGIN,
   bufferSource,
   canonicalJson,
+  createPerformanceAggregateAdmission,
   createPerformanceAdmission,
   performanceAdmissionArtifactName,
   performanceEvidenceArtifactName,
@@ -158,13 +162,60 @@ describe('external performance admission owner', () => {
     await assert.rejects(runPerformanceVerifier(bundle, root), /performance-parity rejected/u)
   })
 
+  it('signs one ordered four-model aggregate over four independently verified leaves', async () => {
+    const fixture = performanceAggregateFixture()
+    const result = await fixture.admit()
+    const raw = await result.files.get('performance-admission.json').read()
+    const admission = JSON.parse(raw)
+    assert.equal(admission.document_type, 'emate.performance-aggregate-admission')
+    assert.deepEqual(admission.roster, PERFORMANCE_MODEL_ROSTER)
+    assert.deepEqual(admission.children.map(child => child.route_id), PERFORMANCE_MODEL_ROSTER.map(model => model.route_id))
+    assert.equal(new Set(admission.children.map(child => child.performance_run_id)).size, 4)
+    assert.equal(admission.verifier.contract, 'ttft-v2-aggregate')
+    assert.equal(admission.verifier.evidence_filename, 'performance-admission.json')
+    assert.ok([...result.files.keys()].every(path => path === 'performance-admission.json' || path.startsWith('children/')))
+    const { signature, ...unsigned } = admission
+    assert.equal(verify(
+      null,
+      Buffer.concat([PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(unsigned), 'utf8')]),
+      fixture.keyPair.publicKey,
+      Buffer.from(signature.value, 'base64'),
+    ), true)
+  })
+
+  it('rejects missing, duplicate, misordered, extra, or failed four-model evidence', async t => {
+    const cases = [
+      ['missing', fixture => { fixture.config.evidenceArtifactIds.pop() }],
+      ['duplicate', fixture => { fixture.config.evidenceArtifactIds[3] = fixture.config.evidenceArtifactIds[0] }],
+      ['misordered', fixture => { fixture.config.evidenceArtifactIds.reverse() }],
+      ['extra file', fixture => {
+        fixture.github.artifacts.get(fixture.config.evidenceArtifactIds[2]).bundle.files.set('extra.json', testSource('{}'))
+      }],
+      ['failed child', fixture => {
+        const id = fixture.config.evidenceArtifactIds[1]
+        const evidence = JSON.parse(fixture.github.file(id, PERFORMANCE_EVIDENCE_FILENAME).buffer)
+        evidence.evidence_kind = 'fixture'
+        fixture.github.replaceFile(id, PERFORMANCE_EVIDENCE_FILENAME, pretty(evidence))
+      }],
+    ]
+    for (const [name, mutate] of cases) {
+      await t.test(name, async () => {
+        const fixture = performanceAggregateFixture()
+        mutate(fixture)
+        await assert.rejects(fixture.admit())
+      })
+    }
+  })
+
   it('exposes a separate action with no caller path, R2 binding, or publication step', async () => {
     const action = await readFile(new URL('../performance/action.yml', import.meta.url), 'utf8')
     const main = await readFile(new URL('../src/performance-main.mjs', import.meta.url), 'utf8')
     assert.match(action, /desktop-artifact-id:/u)
     assert.match(action, /profile-release-run-id:/u)
     assert.match(action, /profile-artifact-id:/u)
-    assert.match(action, /evidence-artifact-id:/u)
+    for (const input of ['luna', 'sol', 'deepseek', 'doubao']) {
+      assert.match(action, new RegExp(`${input}-evidence-artifact-id:`, 'u'))
+    }
     assert.match(action, /artifact-path:/u)
     assert.match(action, /performance-main\.mjs/u)
     const forbidden = new RegExp([
@@ -285,6 +336,50 @@ function performanceFixture() {
     admit: () => createPerformanceAdmission(config, {
       github,
       verifyPerformance: async () => pretty(verified),
+    }),
+  }
+}
+
+function performanceAggregateFixture() {
+  const fixture = performanceFixture()
+  const artifactIds = []
+  for (const [index, model] of PERFORMANCE_MODEL_ROSTER.entries()) {
+    const id = String(210 + index)
+    const evidence = structuredClone(fixture.evidence)
+    evidence.performance_run_id = `production-performance-${model.route_id}`
+    evidence.performance_model = model
+    for (const path of Object.values(evidence.paths)) {
+      path.run_receipt.provider = model.provider
+      path.run_receipt.model = model.model
+    }
+    const evidenceFiles = Object.fromEntries(supportingPaths(evidence).map(path => [path, pretty({ path })]))
+    const artifactValue = githubArtifact(
+      id,
+      performanceEvidenceArtifactName(SOURCE, 1, PERFORMANCE_MODEL_LEAF_IDS[index]),
+      '103',
+      {
+        [PERFORMANCE_EVIDENCE_FILENAME]: pretty(evidence),
+        [PERFORMANCE_VERIFIER_SOURCE]: fixture.verifierBytes,
+        [PROFILE_COMPONENT_AGGREGATE_FILENAME]: fixture.github.file('203', PROFILE_COMPONENT_AGGREGATE_FILENAME).buffer,
+        ...evidenceFiles,
+      },
+    )
+    fixture.github.artifacts.set(id, artifactValue)
+    artifactIds.push(id)
+  }
+  fixture.config.evidenceArtifactIds = artifactIds
+  return {
+    ...fixture,
+    admit: () => createPerformanceAggregateAdmission(fixture.config, {
+      github: fixture.github,
+      verifyPerformance: async bundle => {
+        const evidence = JSON.parse(bundle.files.get(PERFORMANCE_EVIDENCE_FILENAME).buffer)
+        return pretty({
+          ...evidence,
+          production_artifacts_verified: true,
+          decision: { gate_status: 'passed', failures: [], production_receipt_failures: [], comparisons: {} },
+        })
+      },
     }),
   }
 }

@@ -13,6 +13,7 @@ export const EXPECTED_R2_BUCKET = 'emate-desktop-downloads'
 export const RELEASE_VERSION = '2.0.13'
 export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-manifest-v1\0', 'utf8')
 export const PERFORMANCE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-admission-v1\0', 'utf8')
+export const PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-aggregate-admission-v1\0', 'utf8')
 export const PERFORMANCE_EVIDENCE_FILENAME = 'e-mate-performance-evidence.json'
 export const PERFORMANCE_VERIFIER_SOURCE = 'scripts/performance-parity.mjs'
 export const PROFILE_COMPONENT_AGGREGATE_FILENAME = 'profile-component-aggregate.json'
@@ -55,6 +56,89 @@ const PERFORMANCE_ARTIFACT_FIELDS = [
   ['renderer_paint_artifact', 'renderer-paint-trace'],
   ['installed_runtime_artifact', 'installed-runtime-receipt'],
 ]
+export const PERFORMANCE_MODEL_ROSTER = Object.freeze([
+  Object.freeze({ route_id: 'ecorex-chat', provider: 'e-mate-enterprise', model: 'gpt-5.6-luna', reasoning_effort: 'max' }),
+  Object.freeze({ route_id: 'ecorex-gpt-5.6-sol', provider: 'e-mate-enterprise', model: 'gpt-5.6-sol', reasoning_effort: 'medium' }),
+  Object.freeze({ route_id: 'ecorex-deepseek-v4-pro', provider: 'e-mate-enterprise-deepseek', model: 'deepseek-v4-flash', reasoning_effort: 'max' }),
+  Object.freeze({ route_id: 'ecorex-doubao-seed-2.0-pro', provider: 'e-mate-enterprise-doubao', model: 'doubao-seed-2-0-pro-260215', reasoning_effort: 'medium' }),
+])
+export const PERFORMANCE_MODEL_LEAF_IDS = Object.freeze(['luna', 'sol', 'deepseek', 'doubao'])
+
+export async function createPerformanceAggregateAdmission(config, dependencies) {
+  const evidenceArtifactIds = config.evidenceArtifactIds
+  if (!Array.isArray(evidenceArtifactIds) || evidenceArtifactIds.length !== PERFORMANCE_MODEL_ROSTER.length
+    || !evidenceArtifactIds.every(value => RUN_ID.test(value ?? ''))
+    || new Set(evidenceArtifactIds).size !== evidenceArtifactIds.length) {
+    throw new Error('performance aggregate requires four unique evidence artifact ids')
+  }
+  const github = cachedGithub(dependencies.github)
+  const files = new Map()
+  const leaves = []
+  for (const [index, model] of PERFORMANCE_MODEL_ROSTER.entries()) {
+    const result = await createPerformanceAdmission({
+      ...config,
+      evidenceArtifactId: evidenceArtifactIds[index],
+      performanceModel: model,
+      performanceLeafId: PERFORMANCE_MODEL_LEAF_IDS[index],
+    }, { ...dependencies, github })
+    const admissionBytes = await requiredFile(result.files, 'performance-admission.json').read(MAX_JSON_BYTES)
+    const admission = parsePrettyJson(admissionBytes, `${model.route_id} performance admission`)
+    const prefix = performanceChildPrefix(index)
+    for (const [path, source] of result.files) files.set(`${prefix}/${path}`, source)
+    leaves.push({
+      route_id: model.route_id,
+      performance_run_id: result.performanceRunId,
+      admission_sha256: result.admissionSha256,
+      evidence_sha256: result.evidenceSha256,
+      verifier: admission.verifier,
+    })
+  }
+  if (new Set(leaves.map(item => item.performance_run_id)).size !== leaves.length) {
+    throw new Error('performance aggregate child run identities must be unique')
+  }
+  const first = parsePrettyJson(
+    await requiredFile(files, `${performanceChildPrefix(0)}/performance-admission.json`).read(MAX_JSON_BYTES),
+    'first performance admission',
+  )
+  for (const [index, model] of PERFORMANCE_MODEL_ROSTER.entries()) {
+    const admission = parsePrettyJson(
+      await requiredFile(files, `${performanceChildPrefix(index)}/performance-admission.json`).read(MAX_JSON_BYTES),
+      `${model.route_id} performance admission`,
+    )
+    if (admission.source_commit !== first.source_commit || admission.base_contract_id !== first.base_contract_id
+      || admission.profile_component_aggregate_sha256 !== first.profile_component_aggregate_sha256
+      || canonicalJson(admission.desktop_artifacts) !== canonicalJson(first.desktop_artifacts)) {
+      throw new Error('performance aggregate children do not bind one release')
+    }
+  }
+  const verifier = aggregatePerformanceVerifier(leaves, config.sourceCommit)
+  const evidenceSha256 = sha256(Buffer.from(canonicalJson(leaves.map(item => item.evidence_sha256)), 'utf8'))
+  const performanceRunId = `performance-aggregate-${sha256(Buffer.from(canonicalJson(leaves), 'utf8')).slice(0, 40)}`
+  const unsigned = {
+    schema_version: 1,
+    document_type: 'emate.performance-aggregate-admission',
+    status: 'passed',
+    performance_run_id: performanceRunId,
+    source_commit: first.source_commit,
+    base_contract_id: first.base_contract_id,
+    profile_component_aggregate_sha256: first.profile_component_aggregate_sha256,
+    desktop_artifacts: first.desktop_artifacts,
+    roster: PERFORMANCE_MODEL_ROSTER,
+    children: leaves,
+    evidence_sha256: evidenceSha256,
+    verifier,
+  }
+  const admission = signPerformanceAggregateAdmission(unsigned, config.privateKeyPem, config.signingKeyId)
+  const admissionBytes = Buffer.from(`${JSON.stringify(admission, null, 2)}\n`)
+  files.set('performance-admission.json', bufferSource(admissionBytes))
+  return {
+    artifactName: performanceAdmissionArtifactName(config.sourceCommit, config.currentRunAttempt),
+    files,
+    performanceRunId,
+    admissionSha256: sha256(admissionBytes),
+    evidenceSha256,
+  }
+}
 
 export async function createPerformanceAdmission(config, dependencies) {
   validatePerformanceInvocation(config)
@@ -149,7 +233,11 @@ export async function createPerformanceAdmission(config, dependencies) {
   const evidenceArtifact = await github.getArtifact(config.evidenceArtifactId)
   assertArtifactMetadata(evidenceArtifact, {
     id: config.evidenceArtifactId,
-    name: performanceEvidenceArtifactName(config.sourceCommit, config.currentRunAttempt),
+    name: performanceEvidenceArtifactName(
+      config.sourceCommit,
+      config.currentRunAttempt,
+      config.performanceLeafId,
+    ),
   })
   await validateCurrentPerformanceRun(github, evidenceArtifact.runId, config)
   const evidenceBundle = await github.downloadArtifact(config.evidenceArtifactId)
@@ -193,6 +281,7 @@ export async function createPerformanceAdmission(config, dependencies) {
     base,
     profileComponentAggregate,
     candidate,
+    config.performanceModel,
   )
 
   const verifier = {
@@ -375,24 +464,51 @@ export async function prepareDesktopPublication(config, dependencies) {
   const performanceBundle = await github.downloadArtifact(performanceReference.artifact_id)
   assertDownloadedArtifact(performanceBundle, performanceArtifact)
   assertNoMacSmoke(performanceBundle.files)
-  const evidenceSource = requiredFile(performanceBundle.files, PERFORMANCE_EVIDENCE_FILENAME)
-  const evidenceBytes = await readPerformanceFile(evidenceSource)
-  const evidence = parsePrettyJson(evidenceBytes, 'performance evidence')
-  assertExactFileSet(performanceBundle.files, [
-    'performance-admission.json',
-    ...performanceEvidenceFiles(evidence),
-  ])
   const performanceAdmissionSource = requiredFile(performanceBundle.files, 'performance-admission.json')
   const performanceAdmissionBytes = await readSmall(performanceAdmissionSource)
   const performanceAdmission = parsePrettyJson(performanceAdmissionBytes, 'performance admission')
-  validatePerformanceAdmission(
+  validatePerformanceAggregateAdmission(
     performanceAdmission,
     performanceAdmissionBytes,
     unsigned,
     signing.publicKey,
     config.signingKeyId,
   )
-  validateAdmittedPerformanceEvidence(evidence, evidenceBytes, performanceAdmission)
+  const expectedPerformanceFiles = ['performance-admission.json']
+  for (const [index, model] of PERFORMANCE_MODEL_ROSTER.entries()) {
+    const prefix = performanceChildPrefix(index)
+    const child = performanceAdmission.children[index]
+    const leafAdmissionBytes = await readSmall(requiredFile(performanceBundle.files, `${prefix}/performance-admission.json`))
+    const leafAdmission = parsePrettyJson(leafAdmissionBytes, `${model.route_id} performance admission`)
+    const evidenceBytes = await readPerformanceFile(requiredFile(performanceBundle.files, `${prefix}/${PERFORMANCE_EVIDENCE_FILENAME}`))
+    const evidence = parsePrettyJson(evidenceBytes, `${model.route_id} performance evidence`)
+    const leafManifest = {
+      ...unsigned,
+      performance: {
+        performance_run_id: child.performance_run_id,
+        admission_sha256: child.admission_sha256,
+        signature_key_id: unsigned.performance.signature_key_id,
+        verifier: child.verifier,
+      },
+    }
+    validatePerformanceAdmission(
+      leafAdmission,
+      leafAdmissionBytes,
+      leafManifest,
+      signing.publicKey,
+      config.signingKeyId,
+    )
+    if (leafAdmission.performance_run_id !== child.performance_run_id
+      || sha256(leafAdmissionBytes) !== child.admission_sha256
+      || leafAdmission.evidence_sha256 !== child.evidence_sha256
+      || canonicalJson(leafAdmission.verifier) !== canonicalJson(child.verifier)) {
+      throw new Error(`performance aggregate child ${model.route_id} drifted`)
+    }
+    validateAdmittedPerformanceEvidence(evidence, evidenceBytes, leafAdmission, model)
+    expectedPerformanceFiles.push(...performanceEvidenceFiles(evidence).map(path => `${prefix}/${path}`))
+    expectedPerformanceFiles.push(`${prefix}/performance-admission.json`)
+  }
+  assertExactFileSet(performanceBundle.files, expectedPerformanceFiles)
 
   const signatureValue = sign(
     null,
@@ -836,6 +952,68 @@ function validatePerformanceAdmission(admission, rawBytes, manifest, publicKey, 
   )) throw new Error('performance admission signature is invalid')
 }
 
+function validatePerformanceAggregateAdmission(admission, rawBytes, manifest, publicKey, keyId) {
+  const keys = [
+    'schema_version', 'document_type', 'status', 'performance_run_id', 'source_commit',
+    'base_contract_id', 'profile_component_aggregate_sha256', 'desktop_artifacts',
+    'roster', 'children', 'evidence_sha256', 'verifier', 'signature',
+  ]
+  if (!hasExactKeys(admission, keys) || admission.schema_version !== 1
+    || admission.document_type !== 'emate.performance-aggregate-admission' || admission.status !== 'passed'
+    || admission.performance_run_id !== manifest.performance.performance_run_id
+    || admission.source_commit !== manifest.source_commit || admission.base_contract_id !== manifest.base_contract_id
+    || admission.profile_component_aggregate_sha256 !== manifest.profile_component_aggregate.aggregate_sha256
+    || canonicalJson(admission.roster) !== canonicalJson(PERFORMANCE_MODEL_ROSTER)
+    || !Array.isArray(admission.children) || admission.children.length !== PERFORMANCE_MODEL_ROSTER.length
+    || !SHA256.test(admission.evidence_sha256 ?? '')
+    || !performanceVerifier(admission.verifier, admission.source_commit)
+    || admission.verifier.contract !== 'ttft-v2-aggregate'
+    || canonicalJson(admission.verifier) !== canonicalJson(manifest.performance.verifier)
+    || !hasExactKeys(admission.desktop_artifacts, ['darwin', 'win32'])
+    || sha256(rawBytes) !== manifest.performance.admission_sha256
+    || !hasExactKeys(admission.signature, ['algorithm', 'key_id', 'value'])
+    || admission.signature.algorithm !== 'ed25519' || admission.signature.key_id !== keyId
+    || admission.signature.key_id !== manifest.performance.signature_key_id) {
+    throw new Error('signed performance aggregate does not bind the Desktop release')
+  }
+  for (const platform of ['darwin', 'win32']) {
+    const item = admission.desktop_artifacts[platform]
+    const expected = manifest.artifacts[platform]
+    if (!hasExactKeys(item, ['bytes', 'sha256']) || item.bytes !== expected.bytes || item.sha256 !== expected.sha256) {
+      throw new Error(`performance aggregate ${platform} artifact drifted`)
+    }
+  }
+  for (const [index, child] of admission.children.entries()) {
+    if (!hasExactKeys(child, [
+      'route_id', 'performance_run_id', 'admission_sha256', 'evidence_sha256', 'verifier',
+    ]) || child.route_id !== PERFORMANCE_MODEL_ROSTER[index].route_id
+      || typeof child.performance_run_id !== 'string' || child.performance_run_id.length < 16
+      || !SHA256.test(child.admission_sha256 ?? '') || !SHA256.test(child.evidence_sha256 ?? '')
+      || !performanceVerifier(child.verifier, admission.source_commit)
+      || child.verifier.contract !== 'ttft-v2') {
+      throw new Error('performance aggregate child order or identity is invalid')
+    }
+  }
+  for (const field of ['performance_run_id', 'admission_sha256', 'evidence_sha256']) {
+    if (new Set(admission.children.map(item => item[field])).size !== admission.children.length) {
+      throw new Error(`performance aggregate child ${field} is duplicated`)
+    }
+  }
+  if (admission.evidence_sha256 !== sha256(Buffer.from(
+    canonicalJson(admission.children.map(item => item.evidence_sha256)), 'utf8',
+  )) || canonicalJson(admission.verifier) !== canonicalJson(
+    aggregatePerformanceVerifier(admission.children, admission.source_commit),
+  )) throw new Error('performance aggregate child digest is invalid')
+  const signatureBytes = strictBase64(admission.signature.value)
+  const { signature, ...unsigned } = admission
+  if (signatureBytes?.byteLength !== 64 || !verify(
+    null,
+    Buffer.concat([PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(unsigned), 'utf8')]),
+    publicKey,
+    signatureBytes,
+  )) throw new Error('performance aggregate signature is invalid')
+}
+
 function profileAggregate(value) {
   if (!hasExactKeys(value, ['aggregate_sha256', 'inventory_sha256', 'staged_profile_tree_sha256', 'targets'])
     || !SHA256.test(value.aggregate_sha256 ?? '') || !SHA256.test(value.inventory_sha256 ?? '')
@@ -863,10 +1041,12 @@ function performanceVerifier(value, sourceCommit) {
   return hasExactKeys(value, [
     'contract', 'source', 'source_commit', 'source_sha256', 'harness_commit',
     'evidence_filename', 'decision_sha256', 'gate_status',
-  ]) && value.contract === 'ttft-v2' && value.source === PERFORMANCE_VERIFIER_SOURCE
+  ]) && ['ttft-v2', 'ttft-v2-aggregate'].includes(value.contract) && value.source === PERFORMANCE_VERIFIER_SOURCE
     && (sourceCommit === undefined ? SHA40.test(value.source_commit ?? '') : value.source_commit === sourceCommit)
     && SHA256.test(value.source_sha256 ?? '') && SHA40.test(value.harness_commit ?? '')
-    && value.evidence_filename === PERFORMANCE_EVIDENCE_FILENAME
+    && value.evidence_filename === (value.contract === 'ttft-v2'
+      ? PERFORMANCE_EVIDENCE_FILENAME
+      : 'performance-admission.json')
     && SHA256.test(value.decision_sha256 ?? '') && value.gate_status === 'passed'
 }
 
@@ -905,7 +1085,7 @@ function safeArtifactPath(value) {
     && !value.includes('\\') && value.split('/').every(part => part !== '' && part !== '.' && part !== '..')
 }
 
-function validateVerifiedPerformanceEvidence(evidence, input, sourceCommit, base, aggregate, candidate) {
+function validateVerifiedPerformanceEvidence(evidence, input, sourceCommit, base, aggregate, candidate, model) {
   if (evidence.evidence_kind !== 'production-real-provider'
     || evidence.production_artifacts_verified !== true
     || evidence.performance_run_id !== input.performance_run_id
@@ -917,6 +1097,7 @@ function validateVerifiedPerformanceEvidence(evidence, input, sourceCommit, base
     || evidence.decision.production_receipt_failures.length !== 0) {
     throw new Error('performance-parity did not produce passed production evidence')
   }
+  if (model !== undefined) validatePerformanceModelEvidence(evidence, input, model)
   for (const pathName of PERFORMANCE_PATHS.slice(1)) {
     const receipt = evidence.paths[pathName]?.run_receipt
     const runtime = receipt?.runtime
@@ -936,7 +1117,7 @@ function validateVerifiedPerformanceEvidence(evidence, input, sourceCommit, base
   }
 }
 
-function validateAdmittedPerformanceEvidence(evidence, evidenceBytes, admission) {
+function validateAdmittedPerformanceEvidence(evidence, evidenceBytes, admission, model) {
   if (sha256(evidenceBytes) !== admission.evidence_sha256
     || evidence.performance_run_id !== admission.performance_run_id
     || evidence.evidence_kind !== 'production-real-provider'
@@ -946,6 +1127,17 @@ function validateAdmittedPerformanceEvidence(evidence, evidenceBytes, admission)
     || sha256(Buffer.from(`${JSON.stringify(evidence.decision, null, 2)}\n`, 'utf8'))
       !== admission.verifier.decision_sha256) {
     throw new Error('performance evidence does not match the signed admission')
+  }
+  if (model !== undefined) validatePerformanceModelEvidence(evidence, evidence, model)
+}
+
+function validatePerformanceModelEvidence(evidence, input, model) {
+  if (!hasExactKeys(evidence.performance_model, ['route_id', 'provider', 'model', 'reasoning_effort'])
+    || canonicalJson(evidence.performance_model) !== canonicalJson(model)
+    || canonicalJson(input.performance_model) !== canonicalJson(model)
+    || PERFORMANCE_PATHS.some(path => evidence.paths?.[path]?.run_receipt?.provider !== model.provider
+      || evidence.paths?.[path]?.run_receipt?.model !== model.model)) {
+    throw new Error('performance evidence does not bind the fixed model roster')
   }
 }
 
@@ -1056,8 +1248,57 @@ export function signPerformanceAdmission(unsigned, privateKeyPem, keyId) {
   return { ...unsigned, signature: { algorithm: 'ed25519', key_id: keyId, value } }
 }
 
-export function performanceEvidenceArtifactName(sourceCommit, runAttempt) {
-  return performanceArtifactName('evidence', sourceCommit, runAttempt)
+export function signPerformanceAggregateAdmission(unsigned, privateKeyPem, keyId) {
+  const privateKey = createPrivateKey(privateKeyPem)
+  const value = sign(
+    null,
+    Buffer.concat([PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(unsigned), 'utf8')]),
+    privateKey,
+  ).toString('base64')
+  return { ...unsigned, signature: { algorithm: 'ed25519', key_id: keyId, value } }
+}
+
+function aggregatePerformanceVerifier(children, sourceCommit) {
+  const first = children[0]?.verifier
+  if (!performanceVerifier(first, sourceCommit) || first.contract !== 'ttft-v2'
+    || !children.every(child => performanceVerifier(child.verifier, sourceCommit)
+      && child.verifier.contract === 'ttft-v2'
+      && child.verifier.source_sha256 === first.source_sha256
+      && child.verifier.harness_commit === first.harness_commit)) {
+    throw new Error('performance aggregate child verifiers do not bind one protected verifier')
+  }
+  return {
+    contract: 'ttft-v2-aggregate',
+    source: PERFORMANCE_VERIFIER_SOURCE,
+    source_commit: sourceCommit,
+    source_sha256: first.source_sha256,
+    harness_commit: first.harness_commit,
+    evidence_filename: 'performance-admission.json',
+    decision_sha256: sha256(Buffer.from(canonicalJson(children.map(child => child.verifier.decision_sha256)), 'utf8')),
+    gate_status: 'passed',
+  }
+}
+
+function performanceChildPrefix(index) {
+  return `children/${String(index + 1).padStart(2, '0')}-${PERFORMANCE_MODEL_LEAF_IDS[index]}`
+}
+
+function cachedGithub(github) {
+  const methods = ['getRepository', 'getBranchHead', 'getBranchProtection', 'getRun', 'getRunJobs', 'getArtifact', 'downloadArtifact', 'getFile']
+  const cache = new Map()
+  return Object.fromEntries(methods.map(name => [name, async (...args) => {
+    const key = `${name}:${canonicalJson(args)}`
+    if (!cache.has(key)) cache.set(key, Promise.resolve(github[name](...args)))
+    return cache.get(key)
+  }]))
+}
+
+export function performanceEvidenceArtifactName(sourceCommit, runAttempt, leafId) {
+  const suffix = leafId === undefined ? '' : `-${leafId}`
+  if (leafId !== undefined && !PERFORMANCE_MODEL_LEAF_IDS.includes(leafId)) {
+    throw new Error('performance model leaf is invalid')
+  }
+  return performanceArtifactName(`evidence${suffix}`, sourceCommit, runAttempt)
 }
 
 export function performanceAdmissionArtifactName(sourceCommit, runAttempt) {
@@ -1065,7 +1306,7 @@ export function performanceAdmissionArtifactName(sourceCommit, runAttempt) {
 }
 
 function performanceArtifactName(kind, sourceCommit, runAttempt) {
-  if (!['evidence', 'admission'].includes(kind) || !SHA40.test(sourceCommit)
+  if (!(kind === 'admission' || kind === 'evidence' || kind.startsWith('evidence-')) || !SHA40.test(sourceCommit)
     || String(runAttempt) !== '1') throw new Error('performance artifact identity is invalid')
   return `e-mate-performance-${kind}-${sourceCommit}-attempt-${runAttempt}`
 }
