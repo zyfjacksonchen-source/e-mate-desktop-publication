@@ -53,21 +53,23 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     assert.deepEqual(Object.keys(plan), [
       'schema_version', 'document_type', 'status', 'publication_authority', 'repository',
       'source_commit', 'bucket', 'public_origin', 'github', 'signed_manifest',
-      'legacy_tombstone', 'immutable_objects', 'active_pointer',
+      'immutable_objects', 'active_pointer', 'legacy_bootstrap_pointer',
     ])
     assert.equal(plan.status, 'ready-for-cloudflare-plugin')
     assert.equal(plan.publication_authority, 'codex-cloudflare-plugin')
-    assert.equal(plan.active_pointer.execution_order, 'last')
+    assert.equal(plan.active_pointer.execution_order, 'before-legacy-bootstrap')
     assert.equal(plan.active_pointer.expected_current, 'absent')
     assert.equal(plan.active_pointer.cache_control, 'no-store')
-    assert.deepEqual(plan.legacy_tombstone, {
-      status: 'expected-unchanged',
-      mutation: 'forbidden',
+    assert.deepEqual(plan.legacy_bootstrap_pointer, {
+      execution_order: 'last',
       key: LEGACY_TOMBSTONE.key,
       url: `${PUBLIC_ORIGIN}/${LEGACY_TOMBSTONE.key}`,
-      bytes: LEGACY_TOMBSTONE.bytes,
-      sha256: LEGACY_TOMBSTONE.sha256,
+      expected_current: `${LEGACY_TOMBSTONE.bytes}:${LEGACY_TOMBSTONE.sha256}`,
+      artifact_path: SIGNED_MANIFEST_FILENAME,
+      bytes: signedBytes.byteLength,
+      sha256: sha256(signedBytes),
       content_type: 'application/json',
+      cache_control: 'no-store',
     })
 
     const [mac, win, manual] = plan.immutable_objects
@@ -83,6 +85,7 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     assert.equal(manual.artifact_path, SIGNED_MANIFEST_FILENAME)
     for (const field of ['bytes', 'sha256', 'content_type']) {
       assert.equal(manual[field], plan.active_pointer[field])
+      assert.equal(manual[field], plan.legacy_bootstrap_pointer[field])
     }
     assert.equal(manual.sha256, sha256(signedBytes))
 
@@ -96,6 +99,7 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
       r2_write_performed: false,
       public_readback_performed: false,
       active_pointer_changed: false,
+      legacy_pointer_changed: false,
     })
     assert.equal(handoff.files.signed_manifest.sha256, sha256(signedBytes))
     assert.equal(handoff.files.publication_plan.sha256, sha256(planBytes))
@@ -112,6 +116,9 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     assert.equal(parseExpectedCurrent('absent'), null)
     assert.deepEqual(parseExpectedCurrent(`123:${'f'.repeat(64)}`), fixture.config.expectedSignedCurrent)
     assert.throws(() => parseExpectedCurrent('latest'), /expected signed current/u)
+
+    fixture.config.expectedLegacyCurrent = { bytes: LEGACY_TOMBSTONE.bytes, sha256: 'e'.repeat(64) }
+    await assert.rejects(fixture.prepare(), /exact 2\.0\.12 tombstone/u)
   })
 
   it('accepts the native same-source Windows retry only with its exact staging artifact', async () => {
@@ -400,6 +407,7 @@ function releaseFixture() {
     macosArtifactId: '206',
     windowsArtifactId: '207',
     expectedSignedCurrent: null,
+    expectedLegacyCurrent: { bytes: LEGACY_TOMBSTONE.bytes, sha256: LEGACY_TOMBSTONE.sha256 },
     signingKeyId: KEY_ID,
     privateKeyPem,
   }

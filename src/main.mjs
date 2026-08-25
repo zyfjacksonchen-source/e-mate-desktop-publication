@@ -53,6 +53,7 @@ async function main() {
       macosArtifactId: requiredEnv('EMATE_MACOS_STAGING_ARTIFACT_ID'),
       windowsArtifactId: requiredEnv('EMATE_WINDOWS_STAGING_ARTIFACT_ID'),
       expectedSignedCurrent: parseExpectedCurrent(requiredEnv('EMATE_EXPECTED_SIGNED_CURRENT')),
+      expectedLegacyCurrent: parseExpectedCurrent(requiredEnv('EMATE_EXPECTED_LEGACY_CURRENT')),
       signingKeyId: requiredEnv('EMATE_SIGNING_KEY_ID'),
       privateKeyPem: requiredEnv('EMATE_DESKTOP_SIGNING_PRIVATE_KEY_PEM'),
     }, {
