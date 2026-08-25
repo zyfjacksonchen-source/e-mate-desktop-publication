@@ -17,6 +17,9 @@ export const PERFORMANCE_EVIDENCE_FILENAME = 'e-mate-performance-evidence.json'
 export const PERFORMANCE_VERIFIER_SOURCE = 'scripts/performance-parity.mjs'
 export const PROFILE_COMPONENT_AGGREGATE_FILENAME = 'profile-component-aggregate.json'
 export const MAX_PERFORMANCE_FILE_BYTES = 64 * 1024 * 1024
+export const SIGNED_MANIFEST_FILENAME = 'desktop-release-signed.json'
+export const PUBLICATION_PLAN_FILENAME = 'cloudflare-publication-plan.json'
+export const CLOUDFLARE_HANDOFF_FILENAME = 'cloudflare-plugin-handoff.json'
 const PROFILE_AGGREGATE_CONTEXT = Buffer.from('e-mate-profile-aggregate-v1\0', 'utf8')
 export const DESKTOP_RELEASE_ARTIFACT_NAMES = Object.freeze({
   candidate: 'desktop-candidate.json',
@@ -28,19 +31,6 @@ export const LEGACY_TOMBSTONE = Object.freeze({
   key: 'desktop/latest.json',
   bytes: 948,
   sha256: 'e6d5e045364bdac97ea7fef41b1e28a20af06c9f4ffdd85d2c136e982d12a7dc',
-  version: '2.0.12',
-  sourceCommit: '9fbc70ad56c4f263dfa0aa0085f19eded134e32d',
-  buildRunId: '32658103294',
-  artifacts: Object.freeze({
-    darwin: Object.freeze({
-      bytes: 390527181,
-      sha256: 'd2cb459d2e8648213e0b38aa6e210c1a727937be77993b2493e2a7848d5d3b2e',
-    }),
-    win32: Object.freeze({
-      bytes: 272939381,
-      sha256: '52b84e14cce5ad49ada282b9a41913aa751db43765c8dba44088d66148dcd186',
-    }),
-  }),
 })
 
 const SHA256 = /^[0-9a-f]{64}$/u
@@ -248,9 +238,9 @@ export async function createPerformanceAdmission(config, dependencies) {
   }
 }
 
-export async function publishDesktopRelease(config, dependencies) {
+export async function prepareDesktopPublication(config, dependencies) {
   validateInvocation(config)
-  const { github, store, publicReader } = dependencies
+  const { github } = dependencies
 
   await validateProtectedMain(github, config)
   await validateRun(github, config.mainCiRunId, {
@@ -344,14 +334,41 @@ export async function publishDesktopRelease(config, dependencies) {
   )
   validateCandidate(candidate, unsigned)
 
-  const installerSources = {}
+  const stagingArtifacts = {}
   for (const platform of ['darwin', 'win32']) {
     const source = requiredFile(candidateBundle.files, artifactNames[platform])
     const expected = unsigned.artifacts[platform]
     if (source.bytes !== expected.bytes || await source.digest() !== expected.sha256) {
       throw new Error(`GitHub ${platform} installer bytes do not match the admitted manifest`)
     }
-    installerSources[platform] = source
+    const stagingArtifactId = platform === 'darwin' ? config.macosArtifactId : config.windowsArtifactId
+    const stagingRunId = platform === 'darwin' ? candidateReference.run_id : expected.build_run_id
+    const stagingName = `e-mate-desktop-${platform === 'darwin' ? 'macos' : 'windows'}-${config.sourceCommit}`
+    const stagingArtifact = await github.getArtifact(stagingArtifactId)
+    assertArtifactMetadata(stagingArtifact, {
+      id: stagingArtifactId,
+      name: stagingName,
+      runId: stagingRunId,
+    })
+    const stagingBundle = await github.downloadArtifact(stagingArtifactId)
+    assertDownloadedArtifact(stagingBundle, stagingArtifact)
+    assertNoMacSmoke(stagingBundle.files)
+    assertExactFileSet(stagingBundle.files, [artifactNames[platform]])
+    if (typeof stagingBundle.storedEntries !== 'function'
+      || !(await stagingBundle.storedEntries()).has(artifactNames[platform])) {
+      throw new Error(`GitHub ${platform} staging artifact is not a compression-level-0 stored entry`)
+    }
+    const stagingSource = requiredFile(stagingBundle.files, artifactNames[platform])
+    if (stagingSource.bytes !== expected.bytes || await stagingSource.digest() !== expected.sha256) {
+      throw new Error(`GitHub ${platform} staging artifact does not match the final candidate bytes`)
+    }
+    stagingArtifacts[platform] = {
+      id: String(stagingArtifact.id),
+      name: stagingArtifact.name,
+      digest: stagingArtifact.digest,
+      runId: String(stagingArtifact.runId),
+      runAttempt: 1,
+    }
   }
 
   const performanceBundle = await github.downloadArtifact(performanceReference.artifact_id)
@@ -390,108 +407,129 @@ export async function publishDesktopRelease(config, dependencies) {
     },
   }
   const signedBytes = Buffer.from(`${JSON.stringify(signedManifest, null, 2)}\n`)
-  const signedSource = bufferSource(signedBytes)
   const signedIdentity = sha256(Buffer.from(canonicalJson(signedManifest), 'utf8'))
   const signedRawSha256 = sha256(signedBytes)
 
-  const objects = [
+  const immutableObjects = [
     ...['darwin', 'win32'].map(platform => ({
       role: `installer-${platform}`,
       key: keyFromReleaseUrl(unsigned.artifacts[platform].url),
-      source: installerSources[platform],
-      contentType: BINARY_CONTENT_TYPE,
-      cacheControl: IMMUTABLE_CACHE,
+      url: unsigned.artifacts[platform].url,
+      github_artifact_id: stagingArtifacts[platform].id,
+      github_artifact_digest: stagingArtifacts[platform].digest,
+      github_run_id: stagingArtifacts[platform].runId,
+      github_run_attempt: stagingArtifacts[platform].runAttempt,
+      github_artifact_name: stagingArtifacts[platform].name,
+      artifact_path: artifactNames[platform],
+      bytes: unsigned.artifacts[platform].bytes,
+      sha256: unsigned.artifacts[platform].sha256,
+      content_type: BINARY_CONTENT_TYPE,
+      cache_control: IMMUTABLE_CACHE,
     })),
     {
       role: 'manual-manifest',
       key: `desktop/manual/v${RELEASE_VERSION}/latest.json`,
-      source: signedSource,
-      contentType: JSON_CONTENT_TYPE,
-      cacheControl: IMMUTABLE_CACHE,
+      url: `${PUBLIC_ORIGIN}/desktop/manual/v${RELEASE_VERSION}/latest.json`,
+      artifact_path: SIGNED_MANIFEST_FILENAME,
+      bytes: signedBytes.byteLength,
+      sha256: signedRawSha256,
+      content_type: JSON_CONTENT_TYPE,
+      cache_control: IMMUTABLE_CACHE,
     },
   ]
-  const pointer = {
-    role: 'active-pointer',
+  const activePointer = {
+    execution_order: 'last',
     key: 'desktop/signed/latest.json',
-    source: signedSource,
-    contentType: JSON_CONTENT_TYPE,
-    cacheControl: 'no-store',
+    url: `${PUBLIC_ORIGIN}/desktop/signed/latest.json`,
+    expected_current: formatExpectedCurrent(config.expectedSignedCurrent),
+    artifact_path: SIGNED_MANIFEST_FILENAME,
+    bytes: signedBytes.byteLength,
+    sha256: signedRawSha256,
+    content_type: JSON_CONTENT_TYPE,
+    cache_control: 'no-store',
   }
-
-  // Everything below this line is publication state. Complete every validation first.
-  await assertLegacyTombstone(store, publicReader)
-  const preflight = new Map()
-  for (const object of objects) {
-    preflight.set(object.key, await preflightCreateOnlyObject(store, publicReader, object))
+  const githubBinding = {
+    main_ci_run_id: config.mainCiRunId,
+    admission_artifact_id: config.admissionArtifactId,
+    desktop_artifact_id: candidateReference.artifact_id,
+    performance_artifact_id: performanceReference.artifact_id,
+    macos_staging_artifact_id: config.macosArtifactId,
+    windows_staging_artifact_id: config.windowsArtifactId,
   }
-  const expectedPointer = config.expectedSignedCurrent
-  const pointerBefore = await preflightPointer(store, publicReader, pointer, expectedPointer)
-
-  const published = []
-  for (const object of objects.slice(0, 2)) {
-    published.push(await ensureCreateOnly(store, object, preflight.get(object.key)))
-  }
-  const manual = objects[2]
-  published.push(await ensureCreateOnly(store, manual, preflight.get(manual.key)))
-
-  for (const object of objects) {
-    await assertExactObject(store, object, { requireBody: object.role === 'manual-manifest' })
-    await assertExactObject(publicReader, object, { requireBody: object.role === 'manual-manifest' })
-  }
-  await assertLegacyTombstone(store, publicReader)
-  await recheckPointer(store, publicReader, pointerBefore, pointer, expectedPointer)
-
-  let pointerOperation = 'reused'
-  if (!pointerBefore.sameCandidate) {
-    await store.putCas(pointer.key, pointer.source, {
-      expectedEtag: pointerBefore.auth.exists ? pointerBefore.auth.etag : null,
-      contentType: pointer.contentType,
-      cacheControl: pointer.cacheControl,
-    })
-    pointerOperation = 'activated'
-  }
-  await assertExactObject(store, pointer, { requireBody: true })
-  await assertExactObject(publicReader, pointer, { requireBody: true })
-  await assertLegacyTombstone(store, publicReader)
-
-  return {
+  const publicationPlan = {
     schema_version: 1,
-    document_type: 'emate.desktop-publication-receipt',
-    status: pointerOperation === 'activated' ? 'published' : 'already-published',
+    document_type: 'emate.desktop-cloudflare-publication-plan',
+    status: 'ready-for-cloudflare-plugin',
+    publication_authority: 'codex-cloudflare-plugin',
+    repository: config.repository,
+    source_commit: config.sourceCommit,
+    bucket: EXPECTED_R2_BUCKET,
+    public_origin: PUBLIC_ORIGIN,
+    github: githubBinding,
+    signed_manifest: {
+      artifact_path: SIGNED_MANIFEST_FILENAME,
+      version: RELEASE_VERSION,
+      base_contract_id: unsigned.base_contract_id,
+      schedule_protocol_floor: unsigned.schedule_protocol_floor,
+      identity_sha256: signedIdentity,
+      bytes: signedBytes.byteLength,
+      sha256: signedRawSha256,
+      signature_key_id: config.signingKeyId,
+    },
+    legacy_tombstone: {
+      status: 'expected-unchanged',
+      mutation: 'forbidden',
+      key: LEGACY_TOMBSTONE.key,
+      url: `${PUBLIC_ORIGIN}/${LEGACY_TOMBSTONE.key}`,
+      bytes: LEGACY_TOMBSTONE.bytes,
+      sha256: LEGACY_TOMBSTONE.sha256,
+      content_type: JSON_CONTENT_TYPE,
+    },
+    immutable_objects: immutableObjects,
+    active_pointer: activePointer,
+  }
+  const publicationPlanBytes = Buffer.from(`${JSON.stringify(publicationPlan, null, 2)}\n`)
+  const handoff = {
+    schema_version: 1,
+    document_type: 'emate.codex-cloudflare-plugin-handoff',
+    status: 'ready-for-cloudflare-plugin',
+    publication_authority: 'codex-cloudflare-plugin',
     repository: config.repository,
     source_commit: config.sourceCommit,
     action: {
       repository: config.actionRepository,
       commit: config.actionRef,
     },
-    github: {
-      main_ci_run_id: config.mainCiRunId,
-      admission_artifact_id: config.admissionArtifactId,
-      desktop_artifact_id: candidateReference.artifact_id,
-      performance_artifact_id: performanceReference.artifact_id,
+    github: githubBinding,
+    files: {
+      signed_manifest: {
+        path: SIGNED_MANIFEST_FILENAME,
+        bytes: signedBytes.byteLength,
+        sha256: signedRawSha256,
+      },
+      publication_plan: {
+        path: PUBLICATION_PLAN_FILENAME,
+        bytes: publicationPlanBytes.byteLength,
+        sha256: sha256(publicationPlanBytes),
+      },
     },
-    manifest: {
-      version: RELEASE_VERSION,
-      base_contract_id: unsigned.base_contract_id,
-      schedule_protocol_floor: unsigned.schedule_protocol_floor,
-      identity_sha256: signedIdentity,
-      raw_bytes: signedBytes.byteLength,
-      raw_sha256: signedRawSha256,
-      signature_key_id: config.signingKeyId,
+    production_state: {
+      r2_write_performed: false,
+      public_readback_performed: false,
+      active_pointer_changed: false,
     },
-    legacy_tombstone: {
-      key: LEGACY_TOMBSTONE.key,
-      bytes: LEGACY_TOMBSTONE.bytes,
-      sha256: LEGACY_TOMBSTONE.sha256,
-    },
-    immutable_objects: published,
-    active_pointer: {
-      key: pointer.key,
-      operation: pointerOperation,
-      previous: expectedPointer === null ? null : expectedPointer,
-      bytes: signedBytes.byteLength,
-      sha256: signedRawSha256,
-    },
+  }
+  const handoffBytes = Buffer.from(`${JSON.stringify(handoff, null, 2)}\n`)
+  return {
+    artifactName: `e-mate-desktop-cloudflare-handoff-${config.sourceCommit}`,
+    files: new Map([
+      [SIGNED_MANIFEST_FILENAME, bufferSource(signedBytes)],
+      [PUBLICATION_PLAN_FILENAME, bufferSource(publicationPlanBytes)],
+      [CLOUDFLARE_HANDOFF_FILENAME, bufferSource(handoffBytes)],
+    ]),
+    manifestIdentity: signedIdentity,
+    manifestSha256: signedRawSha256,
+    planSha256: sha256(publicationPlanBytes),
   }
 }
 
@@ -507,7 +545,8 @@ function validateInvocation(config) {
   if (!SHA40.test(config.sourceCommit) || config.githubSha !== config.sourceCommit) {
     throw new Error('caller source commit is invalid or does not match GITHUB_SHA')
   }
-  if (!RUN_ID.test(config.mainCiRunId) || !RUN_ID.test(config.admissionArtifactId)) {
+  if (![config.mainCiRunId, config.admissionArtifactId, config.macosArtifactId, config.windowsArtifactId]
+    .every(value => RUN_ID.test(value ?? ''))) {
     throw new Error('GitHub admission identity is invalid')
   }
   if (typeof config.signingKeyId !== 'string' || config.signingKeyId === '') {
@@ -914,114 +953,6 @@ function githubProvenance(value, sourceCommit) {
       && RUN_ID.test(artifact.run_id ?? '') && artifact.run_attempt === 1)
 }
 
-async function assertLegacyTombstone(store, publicReader) {
-  for (const reader of [store, publicReader]) {
-    const state = await reader.inspect(LEGACY_TOMBSTONE.key, { collectLimit: MAX_JSON_BYTES })
-    if (!state.exists || state.bytes !== LEGACY_TOMBSTONE.bytes || state.sha256 !== LEGACY_TOMBSTONE.sha256
-      || state.cacheControl !== 'no-store' || !state.contentType?.startsWith(JSON_CONTENT_TYPE)
-      || !Buffer.isBuffer(state.body)) throw new Error('legacy 2.0.12 tombstone identity drifted')
-    const value = parseJson(state.body, 'legacy tombstone')
-    if (!hasExactKeys(value, ['schema_version', 'version', 'source_commit', 'artifacts'])
-      || value.schema_version !== 1 || value.version !== LEGACY_TOMBSTONE.version
-      || value.source_commit !== LEGACY_TOMBSTONE.sourceCommit
-      || !hasExactKeys(value.artifacts, ['darwin', 'win32'])) {
-      throw new Error('legacy 2.0.12 tombstone schema drifted')
-    }
-    for (const platform of ['darwin', 'win32']) {
-      const artifact = value.artifacts[platform]
-      const expected = LEGACY_TOMBSTONE.artifacts[platform]
-      if (!hasExactKeys(artifact, ['url', 'bytes', 'sha256', 'build_source_commit', 'build_run_id'])
-        || artifact.bytes !== expected.bytes || artifact.sha256 !== expected.sha256
-        || artifact.build_source_commit !== LEGACY_TOMBSTONE.sourceCommit
-        || artifact.build_run_id !== LEGACY_TOMBSTONE.buildRunId) {
-        throw new Error(`legacy 2.0.12 ${platform} identity drifted`)
-      }
-    }
-  }
-}
-
-async function preflightCreateOnlyObject(store, publicReader, object) {
-  const auth = await store.inspect(object.key)
-  const publicState = await publicReader.inspect(object.key)
-  if (auth.exists !== publicState.exists) throw new Error(`R2/public state split for ${object.key}`)
-  if (!auth.exists) return { auth, public: publicState, same: false }
-  await assertStateMatches(auth, object)
-  await assertStateMatches(publicState, object)
-  return { auth, public: publicState, same: true }
-}
-
-async function preflightPointer(store, publicReader, pointer, expected) {
-  const auth = await store.inspect(pointer.key)
-  const publicState = await publicReader.inspect(pointer.key)
-  if (auth.exists !== publicState.exists) throw new Error('signed pointer authenticated/public state split')
-  if (expected === null) {
-    if (auth.exists) throw new Error('signed pointer exists but expected current is absent')
-    return { auth, public: publicState, sameCandidate: false }
-  }
-  if (!auth.exists || auth.bytes !== expected.bytes || auth.sha256 !== expected.sha256
-    || publicState.bytes !== expected.bytes || publicState.sha256 !== expected.sha256) {
-    throw new Error('signed pointer does not match expected current identity')
-  }
-  assertPointerMetadata(auth)
-  assertPointerMetadata(publicState)
-  const sameCandidate = auth.bytes === pointer.source.bytes && auth.sha256 === await pointer.source.digest()
-  if (!sameCandidate) throw new Error('2.0.13 publisher cannot replace a different signed pointer')
-  return { auth, public: publicState, sameCandidate }
-}
-
-async function recheckPointer(store, publicReader, before, pointer, expected) {
-  const auth = await store.inspect(pointer.key)
-  const publicState = await publicReader.inspect(pointer.key)
-  if (before.sameCandidate) {
-    await assertStateMatches(auth, pointer)
-    await assertStateMatches(publicState, pointer)
-    return
-  }
-  if (expected !== null || auth.exists || publicState.exists) throw new Error('signed pointer changed before CAS activation')
-}
-
-async function ensureCreateOnly(store, object, state) {
-  let operation = 'reused'
-  if (!state.same) {
-    await store.putCreateOnly(object.key, object.source, {
-      contentType: object.contentType,
-      cacheControl: object.cacheControl,
-    })
-    operation = 'created'
-  }
-  return {
-    role: object.role,
-    key: object.key,
-    operation,
-    bytes: object.source.bytes,
-    sha256: await object.source.digest(),
-  }
-}
-
-async function assertExactObject(reader, object, options = {}) {
-  const state = await reader.inspect(object.key, {
-    collectLimit: options.requireBody ? MAX_JSON_BYTES : 0,
-  })
-  await assertStateMatches(state, object)
-  if (options.requireBody && (!Buffer.isBuffer(state.body)
-    || !state.body.equals(await object.source.read(MAX_JSON_BYTES)))) {
-    throw new Error(`R2 object bytes drifted for ${object.key}`)
-  }
-}
-
-async function assertStateMatches(state, object) {
-  if (!state.exists || state.bytes !== object.source.bytes || state.sha256 !== await object.source.digest()
-    || state.cacheControl !== object.cacheControl || !state.contentType?.startsWith(object.contentType)) {
-    throw new Error(`R2 object identity drifted for ${object.key}`)
-  }
-}
-
-function assertPointerMetadata(state) {
-  if (state.cacheControl !== 'no-store' || !state.contentType?.startsWith(JSON_CONTENT_TYPE)) {
-    throw new Error('signed pointer metadata drifted')
-  }
-}
-
 function keyFromReleaseUrl(value) {
   const url = new URL(value)
   if (url.origin !== PUBLIC_ORIGIN || url.username !== '' || url.password !== ''
@@ -1100,7 +1031,6 @@ export function bufferSource(bytes) {
       if (buffer.byteLength > limit) throw new Error('source exceeds read limit')
       return Buffer.from(buffer)
     },
-    stream() { return Buffer.from(buffer) },
   }
 }
 
@@ -1135,6 +1065,10 @@ export function parseExpectedCurrent(value) {
   const bytes = Number(match[1])
   if (!Number.isSafeInteger(bytes)) throw new Error('expected signed current bytes overflow')
   return { bytes, sha256: match[2] }
+}
+
+function formatExpectedCurrent(value) {
+  return value === null ? 'absent' : `${value.bytes}:${value.sha256}`
 }
 
 function strictBase64(value) {

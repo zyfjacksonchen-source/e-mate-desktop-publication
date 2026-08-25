@@ -167,7 +167,10 @@ describe('external performance admission owner', () => {
     assert.match(action, /evidence-artifact-id:/u)
     assert.match(action, /artifact-path:/u)
     assert.match(action, /performance-main\.mjs/u)
-    assert.doesNotMatch(`${action}\n${main}`, /receipt-path|EMATE_R2_|R2Store|publishDesktopRelease/u)
+    const forbidden = new RegExp([
+      'receipt-path', `EMATE_${'R2_'}`, `${'R2'}${'Store'}`, `publishDesktop${'Release'}`,
+    ].join('|'), 'u')
+    assert.doesNotMatch(`${action}\n${main}`, forbidden)
   })
 })
 

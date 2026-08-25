@@ -1,43 +1,60 @@
-name: e-Mate Desktop protected publication
-description: Verify, sign, and CAS-publish one exact admitted e-Mate 2.0.13 Desktop release.
+name: e-Mate Desktop Cloudflare plugin handoff
+description: Verify and sign one admitted e-Mate 2.0.13 Desktop release, then emit a byte-bound Codex Cloudflare plugin publication plan without accessing R2.
 inputs:
   source-sha:
     description: Exact protected-main source commit bound by CI and every release artifact.
     required: true
   main-ci-run-id:
-    description: Successful protected-main CI run containing the CI admission job.
+    description: Successful attempt-1 protected-main CI run containing CI admission.
     required: true
   admission-artifact-id:
-    description: Successful protected-main desktop-admission artifact containing only the unsigned manifest and Base contract.
+    description: Successful attempt-1 protected-main desktop-admission artifact containing only the unsigned manifest and Base contract.
+    required: true
+  macos-artifact-id:
+    description: Exact compression-level-0 single-file e-mate-desktop-macos-<sha> staging artifact from the admitted Desktop run.
+    required: true
+  windows-artifact-id:
+    description: Exact compression-level-0 single-file e-mate-desktop-windows-<sha> staging artifact from the admitted Windows build run.
     required: true
   expected-signed-current:
-    description: Literal absent, or the exact current desktop/signed/latest.json identity as <bytes>:<sha256>.
+    description: Literal absent, or the exact current desktop/signed/latest.json identity as <bytes>:<sha256>, for the Cloudflare plugin to recheck before activation.
     required: true
   signing-key-id:
     description: Existing Base profile_signing_keys identity used for the domain-separated Desktop signature.
     required: true
-  receipt-path:
-    description: Optional new local path for the non-secret CAS receipt.
-    required: false
-    default: ''
 outputs:
-  receipt-path:
-    description: Local non-secret publication receipt path.
-    value: ${{ steps.publish.outputs.receipt_path }}
+  artifact-path:
+    description: Action-owned directory containing only the signed manifest, publication plan, and plugin handoff.
+    value: ${{ steps.prepare.outputs.artifact_path }}
+  artifact-name:
+    description: Exact handoff artifact name the caller must upload to GitHub Actions.
+    value: ${{ steps.prepare.outputs.artifact_name }}
+  signed-manifest-path:
+    description: Local path to desktop-release-signed.json.
+    value: ${{ steps.prepare.outputs.signed_manifest_path }}
+  publication-plan-path:
+    description: Local path to cloudflare-publication-plan.json.
+    value: ${{ steps.prepare.outputs.publication_plan_path }}
+  plugin-handoff-path:
+    description: Local path to cloudflare-plugin-handoff.json.
+    value: ${{ steps.prepare.outputs.plugin_handoff_path }}
   manifest-identity:
     description: Canonical SHA-256 identity of the signed manifest.
-    value: ${{ steps.publish.outputs.manifest_identity }}
+    value: ${{ steps.prepare.outputs.manifest_identity }}
   manifest-sha256:
-    description: SHA-256 of the exact published signed manifest bytes.
-    value: ${{ steps.publish.outputs.manifest_sha256 }}
+    description: SHA-256 of the exact signed manifest bytes.
+    value: ${{ steps.prepare.outputs.manifest_sha256 }}
+  publication-plan-sha256:
+    description: SHA-256 of the exact Cloudflare plugin publication plan bytes.
+    value: ${{ steps.prepare.outputs.publication_plan_sha256 }}
   status:
-    description: published or already-published.
-    value: ${{ steps.publish.outputs.status }}
+    description: Always ready-for-cloudflare-plugin after successful preparation; never a publication claim.
+    value: ${{ steps.prepare.outputs.status }}
 runs:
   using: composite
   steps:
-    - id: publish
-      name: Verify exact provenance, sign once, and publish in fail-closed order
+    - id: prepare
+      name: Verify exact provenance, sign once, and prepare the Cloudflare plugin handoff
       shell: bash
       env:
         EMATE_ACTION_REPOSITORY: ${{ github.action_repository }}
@@ -45,9 +62,10 @@ runs:
         EMATE_SOURCE_SHA: ${{ inputs.source-sha }}
         EMATE_MAIN_CI_RUN_ID: ${{ inputs.main-ci-run-id }}
         EMATE_ADMISSION_ARTIFACT_ID: ${{ inputs.admission-artifact-id }}
+        EMATE_MACOS_STAGING_ARTIFACT_ID: ${{ inputs.macos-artifact-id }}
+        EMATE_WINDOWS_STAGING_ARTIFACT_ID: ${{ inputs.windows-artifact-id }}
         EMATE_EXPECTED_SIGNED_CURRENT: ${{ inputs.expected-signed-current }}
         EMATE_SIGNING_KEY_ID: ${{ inputs.signing-key-id }}
-        EMATE_RECEIPT_PATH: ${{ inputs.receipt-path }}
       run: |
         set -euo pipefail
         test "$(node -p 'process.versions.node.split(".")[0]')" = 24

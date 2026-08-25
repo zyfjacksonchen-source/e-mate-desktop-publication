@@ -1,61 +1,44 @@
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, verify } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 import {
+  CLOUDFLARE_HANDOFF_FILENAME,
   DESKTOP_RELEASE_ARTIFACT_FILES,
   EXPECTED_ACTION_REPOSITORY,
   EXPECTED_REPOSITORY,
   LEGACY_TOMBSTONE,
   PERFORMANCE_EVIDENCE_FILENAME,
-  PERFORMANCE_VERIFIER_SOURCE,
-  PROFILE_COMPONENT_AGGREGATE_FILENAME,
+  PUBLICATION_PLAN_FILENAME,
   PUBLIC_ORIGIN,
   RELEASE_SIGNATURE_CONTEXT,
+  SIGNED_MANIFEST_FILENAME,
   bufferSource,
   canonicalJson,
-  createPerformanceAdmission,
   parseExpectedCurrent,
   performanceAdmissionArtifactName,
-  performanceEvidenceArtifactName,
-  publishDesktopRelease,
+  prepareDesktopPublication,
   signPerformanceAdmission,
 } from '../src/publisher.mjs'
-import { R2Store, validateArchiveEntries } from '../src/main.mjs'
+import { parseStoredArchiveEntries, validateArchiveEntries } from '../src/main.mjs'
 
 const SOURCE = 'a'.repeat(40)
 const BASE_ID = `e-mate-desktop-profile-v7-dsh-${SOURCE.slice(0, 12)}`
 const KEY_ID = 'e0a81164526dcbcd'
 
-describe('external Desktop publication owner', () => {
-  it('accepts only the protected public production repository authority', async () => {
-    assert.equal(EXPECTED_REPOSITORY, 'zyfjacksonchen-source/e-Mate-2.0.11')
-    const rejected = releaseFixture()
-    rejected.config.repository = 'zyfjacksonchen-source/e-Mate'
-    await assert.rejects(rejected.publish(), /unexpected caller repository/u)
-    assert.deepEqual(rejected.store.writes, [])
-
-    const accepted = releaseFixture()
-    const receipt = await accepted.publish()
-    assert.equal(receipt.repository, 'zyfjacksonchen-source/e-Mate-2.0.11')
-    assert.equal(receipt.status, 'published')
-  })
-
-  it('validates everything before writing installers, manual manifest, then the CAS pointer', async () => {
+describe('external Desktop Cloudflare plugin handoff owner', () => {
+  it('verifies protected evidence, signs once, and emits only a closed three-file handoff', async () => {
     const fixture = releaseFixture()
-    const receipt = await fixture.publish()
-
-    assert.equal(receipt.status, 'published')
-    assert.deepEqual(fixture.store.writes.map(item => item.key), [
-      `desktop/releases/v2.0.13/${SOURCE}/e-Mate-2.0.13-mac-universal.dmg`,
-      `desktop/releases/v2.0.13/${SOURCE}/e-Mate-2.0.13-win-x64-Setup.exe`,
-      'desktop/manual/v2.0.13/latest.json',
-      'desktop/signed/latest.json',
+    const result = await fixture.prepare()
+    assert.equal(result.artifactName, `e-mate-desktop-cloudflare-handoff-${SOURCE}`)
+    assert.deepEqual([...result.files.keys()], [
+      SIGNED_MANIFEST_FILENAME,
+      PUBLICATION_PLAN_FILENAME,
+      CLOUDFLARE_HANDOFF_FILENAME,
     ])
-    assert.ok(fixture.store.events.indexOf('public:desktop/manual/v2.0.13/latest.json')
-      < fixture.store.events.indexOf('cas:desktop/signed/latest.json'))
-    assert.ok(!fixture.store.writes.some(item => item.key === LEGACY_TOMBSTONE.key))
 
-    const signed = JSON.parse(fixture.store.objects.get('desktop/signed/latest.json').body)
+    const signedBytes = await result.files.get(SIGNED_MANIFEST_FILENAME).read()
+    const signed = JSON.parse(signedBytes)
     const { signature, ...unsigned } = signed
     assert.equal(signature.key_id, KEY_ID)
     assert.equal(verify(
@@ -64,111 +47,74 @@ describe('external Desktop publication owner', () => {
       fixture.keyPair.publicKey,
       Buffer.from(signature.value, 'base64'),
     ), true)
-    assert.equal(receipt.manifest.identity_sha256, sha256(Buffer.from(canonicalJson(signed), 'utf8')))
-  })
 
-  it('accepts the same-run signer output over the shared exact three-file Desktop artifact', async () => {
-    const fixture = releaseFixture()
-    assert.deepEqual([...fixture.github.artifacts.get('202').bundle.files.keys()], DESKTOP_RELEASE_ARTIFACT_FILES)
-
-    const { admission, receipt } = await fixture.admitAndPublish()
-
-    assert.equal(admission.artifactName, performanceAdmissionArtifactName(SOURCE, 1))
-    assert.deepEqual(
-      [...fixture.github.artifacts.get('203').bundle.files.keys()].sort(),
-      [...admission.files.keys()].sort(),
-    )
-    assert.equal(receipt.status, 'published')
-  })
-
-  it('fails closed before the first write for provenance, trust, bytes, schema, or tombstone drift', async t => {
-    const cases = [
-      ['unprotected main', fixture => { fixture.github.protection.enforceAdmins = false }],
-      ['force-pushable main', fixture => { fixture.github.protection.allowForcePushes = true }],
-      ['private production repository', fixture => { fixture.github.repository.visibility = 'private' }],
-      ['failed CI job', fixture => { fixture.github.jobs.get('100')[0].conclusion = 'failure' }],
-      ['rerun CI remains rejected', fixture => { fixture.github.runs.get('100').runAttempt = 2 }],
-      ['rerun admission remains rejected', fixture => { fixture.github.runs.get('101').runAttempt = 2 }],
-      ['in-progress desktop build run remains rejected', fixture => {
-        Object.assign(fixture.github.runs.get('102'), { status: 'in_progress', conclusion: null })
-      }],
-      ['rerun Desktop build remains rejected', fixture => { fixture.github.runs.get('102').runAttempt = 2 }],
-      ['Base trust-key drift', fixture => {
-        const base = JSON.parse(fixture.github.file('201', 'base-contract.json').buffer)
-        base.profile_signing_keys[0].public_key_spki_der_base64 = Buffer.alloc(44).toString('base64')
-        fixture.github.replaceFile('201', 'base-contract.json', pretty(base))
-      }],
-      ['Base schema drift', fixture => {
-        const base = JSON.parse(fixture.github.file('201', 'base-contract.json').buffer)
-        base.unreviewed_field = true
-        fixture.github.replaceFile('201', 'base-contract.json', pretty(base))
-      }],
-      ['GitHub artifact digest drift', fixture => {
-        fixture.github.artifacts.get('202').metadata.digest = `sha256:${'0'.repeat(64)}`
-      }],
-      ['old-attempt performance admission artifact', fixture => {
-        const manifest = JSON.parse(fixture.github.file('201', 'desktop-release-unsigned.json').buffer)
-        manifest.github_artifact_provenance.artifacts[1].run_attempt = 2
-        fixture.github.replaceFile('201', 'desktop-release-unsigned.json', pretty(manifest))
-        fixture.github.runs.get('103').runAttempt = 2
-      }],
-      ['installer-byte drift', fixture => {
-        fixture.github.replaceFile('202', 'e-Mate-2.0.13-win-x64-Setup.exe', Buffer.from('other-win'))
-      }],
-      ['installer build-run drift', fixture => {
-        const manifest = JSON.parse(fixture.github.file('201', 'desktop-release-unsigned.json').buffer)
-        manifest.artifacts.win32.build_run_id = '999'
-        fixture.github.replaceFile('201', 'desktop-release-unsigned.json', pretty(manifest))
-      }],
-      ['performance-signature drift', fixture => {
-        const admission = JSON.parse(fixture.github.file('203', 'performance-admission.json').buffer)
-        admission.signature.value = Buffer.alloc(64).toString('base64')
-        const raw = pretty(admission)
-        fixture.github.replaceFile('203', 'performance-admission.json', raw)
-        const manifest = JSON.parse(fixture.github.file('201', 'desktop-release-unsigned.json').buffer)
-        manifest.performance.admission_sha256 = sha256(raw)
-        fixture.github.replaceFile('201', 'desktop-release-unsigned.json', pretty(manifest))
-      }],
-      ['unsigned-field drift', fixture => {
-        const manifest = JSON.parse(fixture.github.file('201', 'desktop-release-unsigned.json').buffer)
-        manifest.channel = 'stable'
-        fixture.github.replaceFile('201', 'desktop-release-unsigned.json', pretty(manifest))
-      }],
-      ['legacy tombstone drift', fixture => {
-        fixture.store.objects.get(LEGACY_TOMBSTONE.key).body = Buffer.from('drift')
-      }],
-      ['manual create-only collision', fixture => {
-        fixture.store.objects.set('desktop/manual/v2.0.13/latest.json', objectRecord(Buffer.from('different'), {
-          contentType: 'application/json', cacheControl: 'public,max-age=31536000,immutable',
-        }))
-      }],
-    ]
-    for (const [name, mutate] of cases) {
-      await t.test(name, async () => {
-        const fixture = releaseFixture()
-        mutate(fixture)
-        await assert.rejects(fixture.publish())
-        assert.deepEqual(fixture.store.writes, [])
-      })
-    }
-  })
-
-  it('does not activate the pointer when public byte readback fails after immutable writes', async () => {
-    const fixture = releaseFixture()
-    fixture.store.publicTransform = (key, state) => key === 'desktop/manual/v2.0.13/latest.json' && state.exists
-      ? { ...state, sha256: 'f'.repeat(64) }
-      : state
-
-    await assert.rejects(fixture.publish(), /identity drifted/u)
-    assert.deepEqual(fixture.store.writes.map(item => item.key), [
-      `desktop/releases/v2.0.13/${SOURCE}/e-Mate-2.0.13-mac-universal.dmg`,
-      `desktop/releases/v2.0.13/${SOURCE}/e-Mate-2.0.13-win-x64-Setup.exe`,
-      'desktop/manual/v2.0.13/latest.json',
+    const planBytes = await result.files.get(PUBLICATION_PLAN_FILENAME).read()
+    const plan = JSON.parse(planBytes)
+    assert.deepEqual(Object.keys(plan), [
+      'schema_version', 'document_type', 'status', 'publication_authority', 'repository',
+      'source_commit', 'bucket', 'public_origin', 'github', 'signed_manifest',
+      'legacy_tombstone', 'immutable_objects', 'active_pointer',
     ])
-    assert.equal(fixture.store.objects.has('desktop/signed/latest.json'), false)
+    assert.equal(plan.status, 'ready-for-cloudflare-plugin')
+    assert.equal(plan.publication_authority, 'codex-cloudflare-plugin')
+    assert.equal(plan.active_pointer.execution_order, 'last')
+    assert.equal(plan.active_pointer.expected_current, 'absent')
+    assert.equal(plan.active_pointer.cache_control, 'no-store')
+    assert.deepEqual(plan.legacy_tombstone, {
+      status: 'expected-unchanged',
+      mutation: 'forbidden',
+      key: LEGACY_TOMBSTONE.key,
+      url: `${PUBLIC_ORIGIN}/${LEGACY_TOMBSTONE.key}`,
+      bytes: LEGACY_TOMBSTONE.bytes,
+      sha256: LEGACY_TOMBSTONE.sha256,
+      content_type: 'application/json',
+    })
+
+    const [mac, win, manual] = plan.immutable_objects
+    assert.deepEqual([mac.github_artifact_id, win.github_artifact_id], ['206', '207'])
+    assert.deepEqual([mac.github_run_id, win.github_run_id], ['102', '102'])
+    assert.deepEqual([mac.github_run_attempt, win.github_run_attempt], [1, 1])
+    assert.deepEqual([mac.github_artifact_name, win.github_artifact_name], [
+      `e-mate-desktop-macos-${SOURCE}`,
+      `e-mate-desktop-windows-${SOURCE}`,
+    ])
+    assert.deepEqual([mac.artifact_path, win.artifact_path], DESKTOP_RELEASE_ARTIFACT_FILES.slice(1))
+    assert.ok([mac, win].every(item => /^sha256:[0-9a-f]{64}$/u.test(item.github_artifact_digest)))
+    assert.equal(manual.artifact_path, SIGNED_MANIFEST_FILENAME)
+    for (const field of ['bytes', 'sha256', 'content_type']) {
+      assert.equal(manual[field], plan.active_pointer[field])
+    }
+    assert.equal(manual.sha256, sha256(signedBytes))
+
+    const handoff = JSON.parse(await result.files.get(CLOUDFLARE_HANDOFF_FILENAME).read())
+    assert.deepEqual(Object.keys(handoff), [
+      'schema_version', 'document_type', 'status', 'publication_authority', 'repository',
+      'source_commit', 'action', 'github', 'files', 'production_state',
+    ])
+    assert.equal(handoff.status, 'ready-for-cloudflare-plugin')
+    assert.deepEqual(handoff.production_state, {
+      r2_write_performed: false,
+      public_readback_performed: false,
+      active_pointer_changed: false,
+    })
+    assert.equal(handoff.files.signed_manifest.sha256, sha256(signedBytes))
+    assert.equal(handoff.files.publication_plan.sha256, sha256(planBytes))
+    const forbiddenStatus = new RegExp(`"status":"(?:publi${'shed'}|already-publi${'shed'})"`, 'u')
+    assert.doesNotMatch(JSON.stringify({ plan, handoff }), forbiddenStatus)
   })
 
-  it('accepts the repository native same-source Windows retry provenance without relabelling bytes', async () => {
+  it('keeps the expected active pointer identity as data for the plugin, without reading it', async () => {
+    const fixture = releaseFixture()
+    fixture.config.expectedSignedCurrent = { bytes: 123, sha256: 'f'.repeat(64) }
+    const result = await fixture.prepare()
+    const plan = JSON.parse(await result.files.get(PUBLICATION_PLAN_FILENAME).read())
+    assert.equal(plan.active_pointer.expected_current, `123:${'f'.repeat(64)}`)
+    assert.equal(parseExpectedCurrent('absent'), null)
+    assert.deepEqual(parseExpectedCurrent(`123:${'f'.repeat(64)}`), fixture.config.expectedSignedCurrent)
+    assert.throws(() => parseExpectedCurrent('latest'), /expected signed current/u)
+  })
+
+  it('accepts the native same-source Windows retry only with its exact staging artifact', async () => {
     const fixture = releaseFixture()
     const manifest = JSON.parse(fixture.github.file('201', 'desktop-release-unsigned.json').buffer)
     const candidate = JSON.parse(fixture.github.file('202', 'desktop-candidate.json').buffer)
@@ -176,6 +122,7 @@ describe('external Desktop publication owner', () => {
     candidate.artifacts.win32.build_run_id = '99'
     fixture.github.replaceFile('201', 'desktop-release-unsigned.json', pretty(manifest))
     fixture.github.replaceFile('202', 'desktop-candidate.json', pretty(candidate))
+    fixture.github.artifacts.get('207').metadata.runId = '99'
     fixture.github.runs.set('99', {
       ...run('99', '.github/workflows/desktop-release.yml', 'workflow_dispatch'),
       conclusion: 'failure',
@@ -190,82 +137,102 @@ describe('external Desktop publication owner', () => {
       job('Bind native artifacts to the release manifest'),
     ])
 
-    const receipt = await fixture.publish()
-    assert.equal(receipt.status, 'published')
-    assert.equal(fixture.store.objects.has('desktop/signed/latest.json'), true)
+    const result = await fixture.prepare()
+    const plan = JSON.parse(await result.files.get(PUBLICATION_PLAN_FILENAME).read())
+    assert.equal(plan.immutable_objects[1].github_run_id, '99')
   })
 
-  it('resumes an identical partially or fully published release without overwriting immutable keys', async () => {
-    const fixture = releaseFixture()
-    const first = await fixture.publish()
-    const writeCount = fixture.store.writes.length
-    fixture.config.expectedSignedCurrent = {
-      bytes: first.manifest.raw_bytes,
-      sha256: first.manifest.raw_sha256,
+  it('fails closed on authority, provenance, closed-schema, staging, or trust drift', async t => {
+    const cases = [
+      ['unexpected repository', fixture => { fixture.config.repository = 'zyfjacksonchen-source/e-Mate' }],
+      ['unprotected main', fixture => { fixture.github.protection.enforceAdmins = false }],
+      ['private repository', fixture => { fixture.github.repository.visibility = 'private' }],
+      ['failed CI', fixture => { fixture.github.jobs.get('100')[0].conclusion = 'failure' }],
+      ['rerun CI', fixture => { fixture.github.runs.get('100').runAttempt = 2 }],
+      ['rerun admission', fixture => { fixture.github.runs.get('101').runAttempt = 2 }],
+      ['rerun Desktop build', fixture => { fixture.github.runs.get('102').runAttempt = 2 }],
+      ['rerun performance', fixture => { fixture.github.runs.get('103').runAttempt = 2 }],
+      ['extra admission file', fixture => {
+        fixture.github.artifacts.get('201').bundle.files.set('extra.json', testSource('{}'))
+      }],
+      ['extra final candidate file', fixture => {
+        fixture.github.artifacts.get('202').bundle.files.set('extra.bin', testSource('extra'))
+      }],
+      ['extra staging file', fixture => {
+        fixture.github.artifacts.get('206').bundle.files.set('extra.bin', testSource('extra'))
+      }],
+      ['mac-smoke staging file', fixture => {
+        fixture.github.artifacts.get('206').bundle.files.set('mac-smoke.dmg', testSource('smoke'))
+      }],
+      ['symlink payload cannot replace exact installer bytes', fixture => {
+        fixture.github.replaceFile('206', 'e-Mate-2.0.13-mac-universal.dmg', Buffer.from('../outside'))
+      }],
+      ['staging artifact name drift', fixture => {
+        fixture.github.artifacts.get('206').metadata.name = 'other'
+      }],
+      ['staging artifact run drift', fixture => {
+        fixture.github.artifacts.get('207').metadata.runId = '101'
+      }],
+      ['compressed staging entry', fixture => {
+        fixture.github.artifacts.get('206').bundle.stored.delete('e-Mate-2.0.13-mac-universal.dmg')
+      }],
+      ['final installer bytes drift', fixture => {
+        fixture.github.replaceFile('202', 'e-Mate-2.0.13-win-x64-Setup.exe', Buffer.from('other'))
+      }],
+      ['Base trust-key drift', fixture => {
+        const base = JSON.parse(fixture.github.file('201', 'base-contract.json').buffer)
+        base.profile_signing_keys[0].public_key_spki_der_base64 = Buffer.alloc(44).toString('base64')
+        fixture.github.replaceFile('201', 'base-contract.json', pretty(base))
+      }],
+      ['unsigned manifest extra field', fixture => {
+        const manifest = JSON.parse(fixture.github.file('201', 'desktop-release-unsigned.json').buffer)
+        manifest.channel = 'stable'
+        fixture.github.replaceFile('201', 'desktop-release-unsigned.json', pretty(manifest))
+      }],
+    ]
+    for (const [name, mutate] of cases) {
+      await t.test(name, async () => {
+        const fixture = releaseFixture()
+        mutate(fixture)
+        await assert.rejects(fixture.prepare())
+      })
     }
-    const second = await fixture.publish()
-
-    assert.equal(second.status, 'already-published')
-    assert.equal(fixture.store.writes.length, writeCount)
   })
 
-  it('leaves only immutable objects when CAS detects a concurrent pointer', async () => {
-    const fixture = releaseFixture()
-    fixture.store.beforeCas = key => {
-      fixture.store.objects.set(key, objectRecord(Buffer.from('concurrent'), {
-        contentType: 'application/json', cacheControl: 'no-store',
-      }))
-    }
-    await assert.rejects(fixture.publish(), /CAS precondition/u)
-    assert.ok(fixture.store.objects.has('desktop/manual/v2.0.13/latest.json'))
-    assert.ok(!fixture.store.writes.some(item => item.key === 'desktop/signed/latest.json'))
-  })
-
-  it('requires an explicit absent or byte/hash expected pointer identity', () => {
-    assert.equal(parseExpectedCurrent('absent'), null)
-    assert.deepEqual(parseExpectedCurrent(`123:${'a'.repeat(64)}`), { bytes: 123, sha256: 'a'.repeat(64) })
-    assert.throws(() => parseExpectedCurrent('latest'), /expected signed current/u)
+  it('has no R2 credential, object client, network write, or publication claim in the root action', async () => {
+    const sources = await Promise.all([
+      readFile(new URL('../action.yml', import.meta.url), 'utf8'),
+      readFile(new URL('../src/main.mjs', import.meta.url), 'utf8'),
+      readFile(new URL('../src/publisher.mjs', import.meta.url), 'utf8'),
+    ])
+    const text = sources.join('\n')
+    const forbidden = new RegExp([
+      `EMATE_${'R2_'}`, `${'R2'}${'Store'}`, `HttpObject${'Reader'}`, `cloudflare${'storage'}`,
+      `AWS4-${'HMAC'}`, `secret${'AccessKey'}`, `access${'KeyId'}`, `putCreate${'Only'}`, `put${'Cas'}`,
+    ].join('|'), 'u')
+    assert.doesNotMatch(text, forbidden)
+    assert.doesNotMatch(text, /method:\s*['"](?:PUT|HEAD)['"]/u)
+    const publicationClaim = new RegExp(`status:\\s*['"](?:publi${'shed'}|already-publi${'shed'})['"]`, 'u')
+    assert.doesNotMatch(text, publicationClaim)
+    assert.match(text, /ready-for-cloudflare-plugin/u)
+    assert.match(text, /codex-cloudflare-plugin/u)
   })
 
   it('rejects archive paths that could escape or be reinterpreted by unzip', () => {
     assert.doesNotThrow(() => validateArchiveEntries(['base-contract.json', 'evidence/receipt.json']))
-    for (const path of ['../escape', '/absolute', 'wild*card', '-option', 'line\nbreak']) {
+    for (const path of ['../escape', '/absolute', 'wild*card', '-option', 'link/../../secret', 'line\nbreak']) {
       assert.throws(() => validateArchiveEntries([path]), /artifact path/u)
     }
   })
 
-  it('signs R2 conditional requests with SigV4 without placing secrets in the URL', async () => {
-    const calls = []
-    const store = new R2Store({
-      accountId: 'a'.repeat(32),
-      accessKeyId: 'access-id',
-      secretAccessKey: 'do-not-leak-secret',
-      bucket: 'e-mate-downloads',
-      now: () => new Date('2026-08-25T00:00:00.000Z'),
-      fetch: async (url, init) => {
-        calls.push({ url, init })
-        return new Response(null, { status: init.method === 'GET' ? 404 : 200 })
-      },
-    })
-    assert.deepEqual(await store.inspect('desktop/signed/latest.json'), { exists: false })
-    await store.putCreateOnly('desktop/manual/v2.0.13/latest.json', bufferSource(Buffer.from('signed')), {
-      contentType: 'application/json',
-      cacheControl: 'public,max-age=31536000,immutable',
-    })
-    await store.putCas('desktop/signed/latest.json', bufferSource(Buffer.from('signed')), {
-      expectedEtag: '"expected-etag"',
-      contentType: 'application/json',
-      cacheControl: 'no-store',
-    })
-
-    assert.equal(calls.length, 3)
-    assert.ok(!calls[0].url.includes('do-not-leak-secret'))
-    assert.match(calls[0].init.headers.authorization, /^AWS4-HMAC-SHA256 Credential=access-id\//u)
-    assert.equal(calls[1].init.headers['if-none-match'], '*')
-    assert.match(calls[1].init.headers.authorization, /SignedHeaders=[^,]*if-none-match/u)
-    assert.equal(calls[2].init.headers['if-match'], '"expected-etag"')
-    assert.match(calls[2].init.headers.authorization, /SignedHeaders=[^,]*if-match/u)
-    assert.ok(!JSON.stringify(calls).includes('do-not-leak-secret'))
+  it('accepts only a ZIP stored entry for the range-stream installer source', () => {
+    const listing = [
+      '      19  Stored       19   0% 08-25-2026 00:00 00000000  e-Mate-2.0.13-mac-universal.dmg',
+      '      20  Defl:N       18  10% 08-25-2026 00:00 00000000  e-Mate-2.0.13-win-x64-Setup.exe',
+    ].join('\n')
+    assert.deepEqual([...parseStoredArchiveEntries(listing, DESKTOP_RELEASE_ARTIFACT_FILES.slice(1))], [
+      'e-Mate-2.0.13-mac-universal.dmg',
+    ])
   })
 })
 
@@ -275,7 +242,8 @@ function releaseFixture() {
   const publicKey = keyPair.publicKey.export({ format: 'der', type: 'spki' }).toString('base64')
   const mac = Buffer.from('exact-mac-installer')
   const win = Buffer.from('exact-windows-installer')
-  const aggregateUnsigned = {
+  const aggregate = {
+    aggregate_sha256: 'e296a56501500b1383041407beeb3421feedf1729f90ff210fb5cc8a7bc63ada',
     inventory_sha256: '2'.repeat(64),
     staged_profile_tree_sha256: '3'.repeat(64),
     targets: ['darwin-arm64', 'darwin-x64', 'win32-x64'].map(target => ({
@@ -284,32 +252,27 @@ function releaseFixture() {
       component_aggregate_sha256: '5'.repeat(64),
     })),
   }
-  const aggregate = {
-    aggregate_sha256: 'e296a56501500b1383041407beeb3421feedf1729f90ff210fb5cc8a7bc63ada',
-    ...aggregateUnsigned,
-  }
   const artifacts = {
     darwin: manifestArtifact('darwin', mac, '102'),
     win32: manifestArtifact('win32', win, '102'),
   }
   const evidence = publicationEvidence('performance-run-accepted-1', SOURCE, artifacts)
   const evidenceBytes = pretty(evidence)
-  const verifierBytes = Buffer.from('export const verifier = "protected-main"\n')
   const verifier = {
     contract: 'ttft-v2',
     source: 'scripts/performance-parity.mjs',
     source_commit: SOURCE,
-    source_sha256: sha256(verifierBytes),
+    source_sha256: '6'.repeat(64),
     harness_commit: SOURCE,
     evidence_filename: PERFORMANCE_EVIDENCE_FILENAME,
     decision_sha256: sha256(pretty(evidence.decision)),
     gate_status: 'passed',
   }
-  const performanceUnsigned = {
+  const performanceAdmission = signPerformanceAdmission({
     schema_version: 1,
     document_type: 'emate.performance-admission',
     status: 'passed',
-    performance_run_id: 'performance-run-accepted-1',
+    performance_run_id: evidence.performance_run_id,
     source_commit: SOURCE,
     base_contract_id: BASE_ID,
     profile_component_aggregate_sha256: aggregate.aggregate_sha256,
@@ -319,8 +282,7 @@ function releaseFixture() {
     },
     evidence_sha256: sha256(evidenceBytes),
     verifier,
-  }
-  const performanceAdmission = signPerformanceAdmission(performanceUnsigned, privateKeyPem, KEY_ID)
+  }, privateKeyPem, KEY_ID)
   const performanceBytes = pretty(performanceAdmission)
   const candidateBundleSha = '7'.repeat(64)
   const performanceBundleSha = '8'.repeat(64)
@@ -357,7 +319,7 @@ function releaseFixture() {
     schedule_protocol_floor: 1,
     profile_component_aggregate: aggregate,
     performance: {
-      performance_run_id: performanceUnsigned.performance_run_id,
+      performance_run_id: evidence.performance_run_id,
       admission_sha256: sha256(performanceBytes),
       signature_key_id: KEY_ID,
       verifier,
@@ -416,22 +378,14 @@ function releaseFixture() {
         [PERFORMANCE_EVIDENCE_FILENAME]: evidenceBytes,
         ...Object.fromEntries(publicationEvidencePaths(evidence).map(path => [path, Buffer.from('{}')])),
       }),
-      artifact('204', performanceEvidenceArtifactName(SOURCE, 1), '103', '6'.repeat(64), {
-        [PERFORMANCE_EVIDENCE_FILENAME]: evidenceBytes,
-        [PERFORMANCE_VERIFIER_SOURCE]: verifierBytes,
-        [PROFILE_COMPONENT_AGGREGATE_FILENAME]: pretty(aggregate),
-        ...Object.fromEntries(publicationEvidencePaths(evidence).map(path => [path, Buffer.from('{}')])),
+      artifact('206', `e-mate-desktop-macos-${SOURCE}`, '102', 'a'.repeat(64), {
+        'e-Mate-2.0.13-mac-universal.dmg': mac,
       }),
-      artifact('205', `e-mate-profile-native-cloudflare-publication-${SOURCE}`, '104', '5'.repeat(64), {
-        'publication-plan.json': pretty({ status: 'prepared' }),
+      artifact('207', `e-mate-desktop-windows-${SOURCE}`, '102', 'b'.repeat(64), {
+        'e-Mate-2.0.13-win-x64-Setup.exe': win,
       }),
     ],
-    sourceFiles: new Map([
-      ['desktop/e-mate-desktop/base-contract.json', pretty(base)],
-      [PERFORMANCE_VERIFIER_SOURCE, verifierBytes],
-    ]),
   })
-  const store = new FakeStore(legacyManifestBytes())
   const config = {
     repository: EXPECTED_REPOSITORY,
     actionRepository: EXPECTED_ACTION_REPOSITORY,
@@ -443,6 +397,8 @@ function releaseFixture() {
     sourceCommit: SOURCE,
     mainCiRunId: '100',
     admissionArtifactId: '201',
+    macosArtifactId: '206',
+    windowsArtifactId: '207',
     expectedSignedCurrent: null,
     signingKeyId: KEY_ID,
     privateKeyPem,
@@ -450,41 +406,8 @@ function releaseFixture() {
   return {
     keyPair,
     github,
-    store,
     config,
-    publish: () => publishDesktopRelease(config, { github, store, publicReader: store.publicReader }),
-    admitAndPublish: async () => {
-      Object.assign(github.runs.get('103'), { status: 'in_progress', conclusion: null })
-      github.jobs.set('103', [job('TTFT evidence')])
-      const admission = await createPerformanceAdmission({
-        repository: EXPECTED_REPOSITORY,
-        actionRepository: EXPECTED_ACTION_REPOSITORY,
-        actionRef: 'b'.repeat(40),
-        eventName: 'workflow_dispatch',
-        ref: 'refs/heads/main',
-        refProtected: true,
-        githubSha: SOURCE,
-        sourceCommit: SOURCE,
-        mainCiRunId: '100',
-        currentRunId: '103',
-        currentRunAttempt: '1',
-        desktopArtifactId: '202',
-        profileReleaseRunId: '104',
-        profileReleaseArtifactId: '205',
-        evidenceArtifactId: '204',
-        signingKeyId: KEY_ID,
-        privateKeyPem,
-      }, {
-        github,
-        verifyPerformance: async () => evidenceBytes,
-      })
-      assert.deepEqual(await admission.files.get('performance-admission.json').read(), performanceBytes)
-      github.artifacts.get('203').bundle.files = admission.files
-      Object.assign(github.runs.get('103'), { status: 'completed', conclusion: 'success' })
-      github.jobs.set('103', [job('TTFT evidence'), job('Performance admission')])
-      const receipt = await publishDesktopRelease(config, { github, store, publicReader: store.publicReader })
-      return { admission, receipt }
-    },
+    prepare: () => prepareDesktopPublication(config, { github }),
   }
 }
 
@@ -543,7 +466,7 @@ function publicationEvidencePaths(evidence) {
 }
 
 class FakeGithub {
-  constructor({ source, artifacts, sourceFiles = new Map() }) {
+  constructor({ source, artifacts }) {
     this.source = source
     this.repository = {
       fullName: EXPECTED_REPOSITORY,
@@ -564,7 +487,6 @@ class FakeGithub {
       ['101', run('101', '.github/workflows/desktop-admission.yml', 'workflow_dispatch')],
       ['102', run('102', '.github/workflows/desktop-release.yml', 'workflow_dispatch')],
       ['103', run('103', '.github/workflows/desktop-performance.yml', 'workflow_dispatch')],
-      ['104', run('104', '.github/workflows/profile-release.yml', 'workflow_dispatch')],
     ])
     this.jobs = new Map([
       ['100', [job('CI admission')]],
@@ -576,10 +498,8 @@ class FakeGithub {
         job('Bind native artifacts to the release manifest'),
       ]],
       ['103', [job('Performance admission')]],
-      ['104', [job('Prepare signed native Cloudflare publication bundle')]],
     ])
     this.artifacts = new Map(artifacts.map(item => [item.metadata.id, item]))
-    this.sourceFiles = sourceFiles
   }
 
   async getRepository() { return structuredClone(this.repository) }
@@ -589,68 +509,9 @@ class FakeGithub {
   async getRunJobs(id) { return structuredClone(this.jobs.get(String(id))) }
   async getArtifact(id) { return structuredClone(this.artifacts.get(String(id)).metadata) }
   async downloadArtifact(id) { return this.artifacts.get(String(id)).bundle }
-  async getFile(path) { return Buffer.from(this.sourceFiles.get(path)) }
   file(id, name) { return this.artifacts.get(String(id)).bundle.files.get(name) }
   replaceFile(id, name, bytes) {
     this.artifacts.get(String(id)).bundle.files.set(name, testSource(bytes))
-  }
-}
-
-class FakeStore {
-  constructor(legacyBytes) {
-    this.objects = new Map([[LEGACY_TOMBSTONE.key, objectRecord(legacyBytes, {
-      contentType: 'application/json', cacheControl: 'no-store',
-    })]])
-    this.writes = []
-    this.events = []
-    this.publicTransform = undefined
-    this.beforeCas = undefined
-    this.publicReader = {
-      inspect: async (key, options) => {
-        this.events.push(`public:${key}`)
-        const state = await this.#inspect(key, options)
-        return this.publicTransform?.(key, state) ?? state
-      },
-    }
-  }
-
-  async inspect(key, options) {
-    this.events.push(`auth:${key}`)
-    return this.#inspect(key, options)
-  }
-
-  async putCreateOnly(key, source, metadata) {
-    if (this.objects.has(key)) throw new Error('create-only collision')
-    const body = await source.read(Number.MAX_SAFE_INTEGER)
-    this.objects.set(key, objectRecord(body, metadata))
-    this.writes.push({ kind: 'create', key })
-    this.events.push(`create:${key}`)
-  }
-
-  async putCas(key, source, options) {
-    this.beforeCas?.(key)
-    const current = this.objects.get(key)
-    if (options.expectedEtag === null ? current !== undefined : current?.etag !== options.expectedEtag) {
-      throw new Error('CAS precondition failed')
-    }
-    const body = await source.read(Number.MAX_SAFE_INTEGER)
-    this.objects.set(key, objectRecord(body, options))
-    this.writes.push({ kind: 'cas', key })
-    this.events.push(`cas:${key}`)
-  }
-
-  async #inspect(key, options = {}) {
-    const record = this.objects.get(key)
-    if (record === undefined) return { exists: false }
-    return {
-      exists: true,
-      bytes: record.body.byteLength,
-      sha256: sha256(record.body),
-      etag: record.etag,
-      contentType: record.contentType,
-      cacheControl: record.cacheControl,
-      ...(options.collectLimit > 0 ? { body: Buffer.from(record.body) } : {}),
-    }
   }
 }
 
@@ -672,19 +533,21 @@ function job(name) {
 }
 
 function artifact(id, name, runId, archiveSha256, files) {
+  const stored = new Set(Object.keys(files))
   return {
     metadata: { id, name, runId, digest: `sha256:${archiveSha256}`, expired: false },
     bundle: {
       archiveSha256,
       files: new Map(Object.entries(files).map(([path, bytes]) => [path, testSource(bytes)])),
+      stored,
+      storedEntries: async () => new Set(stored),
     },
   }
 }
 
 function testSource(bytes) {
   const buffer = Buffer.from(bytes)
-  const source = bufferSource(buffer)
-  return { ...source, buffer }
+  return { ...bufferSource(buffer), buffer }
 }
 
 function manifestArtifact(platform, bytes, buildRunId) {
@@ -697,40 +560,6 @@ function manifestArtifact(platform, bytes, buildRunId) {
     sha256: sha256(bytes),
     build_source_commit: SOURCE,
     build_run_id: buildRunId,
-  }
-}
-
-function legacyManifestBytes() {
-  const value = {
-    schema_version: 1,
-    version: '2.0.12',
-    source_commit: LEGACY_TOMBSTONE.sourceCommit,
-    artifacts: Object.fromEntries(['darwin', 'win32'].map(platform => {
-      const filename = platform === 'darwin'
-        ? 'e-Mate-2.0.12-mac-universal.dmg'
-        : 'e-Mate-2.0.12-win-x64-Setup.exe'
-      return [platform, {
-        url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.12/${LEGACY_TOMBSTONE.sourceCommit}/${filename}`,
-        bytes: LEGACY_TOMBSTONE.artifacts[platform].bytes,
-        sha256: LEGACY_TOMBSTONE.artifacts[platform].sha256,
-        build_source_commit: LEGACY_TOMBSTONE.sourceCommit,
-        build_run_id: LEGACY_TOMBSTONE.buildRunId,
-      }]
-    })),
-  }
-  const bytes = pretty(value)
-  assert.equal(bytes.byteLength, LEGACY_TOMBSTONE.bytes)
-  assert.equal(sha256(bytes), LEGACY_TOMBSTONE.sha256)
-  return bytes
-}
-
-function objectRecord(body, metadata) {
-  const bytes = Buffer.from(body)
-  return {
-    body: bytes,
-    contentType: metadata.contentType,
-    cacheControl: metadata.cacheControl,
-    etag: `"${sha256(bytes).slice(0, 32)}"`,
   }
 }
 

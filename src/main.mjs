@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createHash, createHmac } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import {
   appendFile,
   lstat,
@@ -18,11 +18,12 @@ import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 import {
+  CLOUDFLARE_HANDOFF_FILENAME,
   EXPECTED_REPOSITORY,
-  EXPECTED_R2_BUCKET,
-  PUBLIC_ORIGIN,
+  PUBLICATION_PLAN_FILENAME,
+  SIGNED_MANIFEST_FILENAME,
   parseExpectedCurrent,
-  publishDesktopRelease,
+  prepareDesktopPublication,
 } from './publisher.mjs'
 
 const API_VERSION = '2022-11-28'
@@ -30,14 +31,15 @@ const MAX_API_BYTES = 2 * 1024 * 1024
 const MAX_OBJECT_BYTES = 2 * 1024 * 1024 * 1024
 
 async function main() {
+  const temporaryRoot = resolve(process.env.RUNNER_TEMP || tmpdir())
   const github = new GithubClient({
     repository: requiredEnv('GITHUB_REPOSITORY'),
     token: requiredEnv('EMATE_GITHUB_PROVENANCE_TOKEN'),
-    temporaryRoot: process.env.RUNNER_TEMP || tmpdir(),
+    temporaryRoot,
   })
-
+  let outputRoot
   try {
-    const receipt = await publishDesktopRelease({
+    const result = await prepareDesktopPublication({
       repository: requiredEnv('GITHUB_REPOSITORY'),
       actionRepository: requiredEnv('EMATE_ACTION_REPOSITORY'),
       actionRef: requiredEnv('EMATE_ACTION_REF'),
@@ -48,34 +50,44 @@ async function main() {
       sourceCommit: requiredEnv('EMATE_SOURCE_SHA'),
       mainCiRunId: requiredEnv('EMATE_MAIN_CI_RUN_ID'),
       admissionArtifactId: requiredEnv('EMATE_ADMISSION_ARTIFACT_ID'),
+      macosArtifactId: requiredEnv('EMATE_MACOS_STAGING_ARTIFACT_ID'),
+      windowsArtifactId: requiredEnv('EMATE_WINDOWS_STAGING_ARTIFACT_ID'),
       expectedSignedCurrent: parseExpectedCurrent(requiredEnv('EMATE_EXPECTED_SIGNED_CURRENT')),
       signingKeyId: requiredEnv('EMATE_SIGNING_KEY_ID'),
       privateKeyPem: requiredEnv('EMATE_DESKTOP_SIGNING_PRIVATE_KEY_PEM'),
     }, {
       github,
-      store: new R2Store({
-        accountId: requiredEnv('EMATE_R2_ACCOUNT_ID'),
-        accessKeyId: requiredEnv('EMATE_R2_ACCESS_KEY_ID'),
-        secretAccessKey: requiredEnv('EMATE_R2_SECRET_ACCESS_KEY'),
-        bucket: EXPECTED_R2_BUCKET,
-      }),
-      publicReader: new HttpObjectReader(PUBLIC_ORIGIN),
     })
-
-    const receiptPath = resolve(process.env.EMATE_RECEIPT_PATH
-      || join(process.env.RUNNER_TEMP || tmpdir(), `e-mate-desktop-publication-${process.env.GITHUB_RUN_ID || 'local'}.json`))
-    await mkdir(dirname(receiptPath), { recursive: true })
-    await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
-    await setOutput('receipt_path', receiptPath)
-    await setOutput('manifest_identity', receipt.manifest.identity_sha256)
-    await setOutput('manifest_sha256', receipt.manifest.raw_sha256)
-    await setOutput('status', receipt.status)
+    outputRoot = await mkdtemp(join(temporaryRoot, 'e-mate-desktop-cloudflare-handoff-'))
+    await materializeOutputFiles(result.files, outputRoot)
+    await setOutput('artifact_path', outputRoot)
+    await setOutput('artifact_name', result.artifactName)
+    await setOutput('signed_manifest_path', join(outputRoot, SIGNED_MANIFEST_FILENAME))
+    await setOutput('publication_plan_path', join(outputRoot, PUBLICATION_PLAN_FILENAME))
+    await setOutput('plugin_handoff_path', join(outputRoot, CLOUDFLARE_HANDOFF_FILENAME))
+    await setOutput('manifest_identity', result.manifestIdentity)
+    await setOutput('manifest_sha256', result.manifestSha256)
+    await setOutput('publication_plan_sha256', result.planSha256)
+    await setOutput('status', 'ready-for-cloudflare-plugin')
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'unknown publication failure'
-    process.stderr.write(`::error::DESKTOP_PUBLICATION_FAILED: ${singleLine(message)}\n`)
+    if (outputRoot !== undefined) await rm(outputRoot, { recursive: true, force: true })
+    const message = error instanceof Error ? error.message : 'unknown publication preparation failure'
+    process.stderr.write(`::error::DESKTOP_PUBLICATION_PREPARATION_FAILED: ${singleLine(message)}\n`)
     process.exitCode = 1
   } finally {
     await github.dispose()
+  }
+}
+
+async function materializeOutputFiles(files, root) {
+  validateArchiveEntries([...files.keys()])
+  for (const [path, source] of files) {
+    if (source.bytes <= 0 || source.bytes > MAX_API_BYTES) {
+      throw new Error(`publication handoff ${path} is empty or oversized`)
+    }
+    const output = join(root, path)
+    await mkdir(dirname(output), { recursive: true, mode: 0o700 })
+    await writeFile(output, await source.read(MAX_API_BYTES), { flag: 'wx', mode: 0o600 })
   }
 }
 
@@ -198,6 +210,7 @@ export class GithubClient {
     return {
       archiveSha256: await digestFile(archive),
       files,
+      storedEntries: () => storedArchiveEntries(archive, entries),
     }
   }
 
@@ -228,156 +241,6 @@ export class GithubClient {
   }
 }
 
-export class R2Store {
-  #accountId
-  #accessKeyId
-  #secretAccessKey
-  #bucket
-  #fetch
-  #now
-
-  constructor(options) {
-    if (!/^[0-9a-f]{32}$/u.test(options.accountId) || !/^[A-Za-z0-9._-]{3,255}$/u.test(options.bucket)
-      || typeof options.accessKeyId !== 'string' || options.accessKeyId === ''
-      || typeof options.secretAccessKey !== 'string' || options.secretAccessKey === '') {
-      throw new Error('R2 publication binding is invalid')
-    }
-    this.#accountId = options.accountId
-    this.#accessKeyId = options.accessKeyId
-    this.#secretAccessKey = options.secretAccessKey
-    this.#bucket = options.bucket
-    this.#fetch = options.fetch ?? globalThis.fetch
-    this.#now = options.now ?? (() => new Date())
-  }
-
-  async inspect(key, options = {}) {
-    const response = await this.#request('GET', key, { payloadHash: sha256(Buffer.alloc(0)) })
-    if (response.status === 404) return { exists: false }
-    if (response.status !== 200) throw new Error(`R2 read failed with HTTP ${response.status}`)
-    const read = await readObjectResponse(response, options.collectLimit ?? 0)
-    const etag = response.headers.get('etag')
-    if (etag === null || etag === '') throw new Error('R2 object is missing its CAS ETag')
-    return {
-      exists: true,
-      ...read,
-      etag,
-      contentType: response.headers.get('content-type'),
-      cacheControl: response.headers.get('cache-control'),
-    }
-  }
-
-  async putCreateOnly(key, source, metadata) {
-    const response = await this.#request('PUT', key, {
-      payloadHash: await source.digest(),
-      body: source.stream(),
-      headers: {
-        'content-type': metadata.contentType,
-        'cache-control': metadata.cacheControl,
-        'if-none-match': '*',
-      },
-    })
-    if (![200, 201, 204].includes(response.status)) {
-      throw new Error(`R2 create-only write failed with HTTP ${response.status}`)
-    }
-  }
-
-  async putCas(key, source, options) {
-    const conditional = options.expectedEtag === null
-      ? { 'if-none-match': '*' }
-      : { 'if-match': options.expectedEtag }
-    const response = await this.#request('PUT', key, {
-      payloadHash: await source.digest(),
-      body: source.stream(),
-      headers: {
-        'content-type': options.contentType,
-        'cache-control': options.cacheControl,
-        ...conditional,
-      },
-    })
-    if (![200, 201, 204].includes(response.status)) {
-      throw new Error(`R2 CAS activation failed with HTTP ${response.status}`)
-    }
-  }
-
-  async #request(method, key, options) {
-    validateObjectKey(key)
-    const host = `${this.#accountId}.r2.cloudflarestorage.com`
-    const canonicalUri = `/${encodePath(this.#bucket)}/${key.split('/').map(encodePath).join('/')}`
-    const url = `https://${host}${canonicalUri}`
-    const now = this.#now()
-    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/gu, '')
-    const shortDate = amzDate.slice(0, 8)
-    const headers = new Map(Object.entries({
-      host,
-      'x-amz-content-sha256': options.payloadHash,
-      'x-amz-date': amzDate,
-      ...(options.headers ?? {}),
-    }).map(([name, value]) => [name.toLowerCase(), String(value).trim().replace(/\s+/gu, ' ')]))
-    const signedHeaders = [...headers.keys()].sort()
-    const canonicalHeaders = `${signedHeaders.map(name => `${name}:${headers.get(name)}`).join('\n')}\n`
-    const canonicalRequest = [
-      method,
-      canonicalUri,
-      '',
-      canonicalHeaders,
-      signedHeaders.join(';'),
-      options.payloadHash,
-    ].join('\n')
-    const scope = `${shortDate}/auto/s3/aws4_request`
-    const stringToSign = [
-      'AWS4-HMAC-SHA256',
-      amzDate,
-      scope,
-      sha256(Buffer.from(canonicalRequest, 'utf8')),
-    ].join('\n')
-    const dateKey = hmac(Buffer.from(`AWS4${this.#secretAccessKey}`, 'utf8'), shortDate)
-    const regionKey = hmac(dateKey, 'auto')
-    const serviceKey = hmac(regionKey, 's3')
-    const signingKey = hmac(serviceKey, 'aws4_request')
-    const signature = hmac(signingKey, stringToSign).toString('hex')
-    headers.set('authorization', `AWS4-HMAC-SHA256 Credential=${this.#accessKeyId}/${scope}, SignedHeaders=${signedHeaders.join(';')}, Signature=${signature}`)
-    headers.delete('host')
-    const body = options.body
-    return this.#fetch(url, {
-      method,
-      headers: Object.fromEntries(headers),
-      redirect: 'error',
-      signal: AbortSignal.timeout(10 * 60_000),
-      ...(body === undefined ? {} : { body, duplex: 'half' }),
-    })
-  }
-}
-
-export class HttpObjectReader {
-  #origin
-  #fetch
-
-  constructor(origin, options = {}) {
-    if (origin !== PUBLIC_ORIGIN) throw new Error('public readback origin drifted')
-    this.#origin = origin
-    this.#fetch = options.fetch ?? globalThis.fetch
-  }
-
-  async inspect(key, options = {}) {
-    validateObjectKey(key)
-    const response = await this.#fetch(`${this.#origin}/${key.split('/').map(encodePath).join('/')}`, {
-      method: 'GET',
-      redirect: 'error',
-      cache: 'no-store',
-      headers: { Accept: '*/*', 'Accept-Encoding': 'identity', 'Cache-Control': 'no-cache' },
-      signal: AbortSignal.timeout(10 * 60_000),
-    })
-    if (response.status === 404) return { exists: false }
-    if (response.status !== 200) throw new Error(`public R2 readback failed with HTTP ${response.status}`)
-    return {
-      exists: true,
-      ...await readObjectResponse(response, options.collectLimit ?? 0),
-      contentType: response.headers.get('content-type'),
-      cacheControl: response.headers.get('cache-control'),
-    }
-  }
-}
-
 class FileSource {
   #path
   #digest
@@ -388,6 +251,7 @@ class FileSource {
   }
 
   async digest() {
+    await this.#assertStable()
     this.#digest ??= await digestFile(this.#path)
     return this.#digest
   }
@@ -396,10 +260,6 @@ class FileSource {
     await this.#assertStable()
     if (this.bytes > limit) throw new Error(`artifact ${basename(this.#path)} exceeds the read limit`)
     return readFile(this.#path)
-  }
-
-  stream() {
-    return createReadStream(this.#path)
   }
 
   async #assertStable() {
@@ -447,6 +307,15 @@ async function extractArchiveEntry(archive, entry, outputPath) {
     throw new Error('GitHub artifact extraction failed')
   }
   return bytes
+}
+
+async function storedArchiveEntries(archive, entries) {
+  return parseStoredArchiveEntries(await runCapture('unzip', ['-lv', archive]), entries)
+}
+
+export function parseStoredArchiveEntries(listing, entries) {
+  const lines = listing.split(/\r?\n/u)
+  return new Set(entries.filter(entry => lines.some(line => line.endsWith(` ${entry}`) && /\sStored\s/u.test(line))))
 }
 
 export function validateArchiveEntries(entries) {
@@ -533,50 +402,6 @@ async function digestFile(path) {
   const digest = createHash('sha256')
   for await (const chunk of createReadStream(path)) digest.update(chunk)
   return digest.digest('hex')
-}
-
-async function readObjectResponse(response, collectLimit) {
-  if (response.body === null) throw new Error('object response has no body')
-  const declared = response.headers.get('content-length')
-  const digest = createHash('sha256')
-  const chunks = []
-  let bytes = 0
-  for await (const chunk of response.body) {
-    bytes += chunk.byteLength
-    if (bytes > MAX_OBJECT_BYTES) throw new Error('object response is oversized')
-    digest.update(chunk)
-    if (collectLimit > 0) {
-      if (bytes > collectLimit) throw new Error('object exceeds collection limit')
-      chunks.push(Buffer.from(chunk))
-    }
-  }
-  if (declared !== null && (!/^[0-9]+$/u.test(declared) || Number(declared) !== bytes)) {
-    throw new Error('object Content-Length does not match its bytes')
-  }
-  return {
-    bytes,
-    sha256: digest.digest('hex'),
-    ...(collectLimit > 0 ? { body: Buffer.concat(chunks) } : {}),
-  }
-}
-
-function validateObjectKey(key) {
-  if (typeof key !== 'string' || key === '' || key.startsWith('/') || key.endsWith('/')
-    || key.includes('\\') || key.split('/').some(part => part === '' || part === '.' || part === '..')) {
-    throw new Error('R2 object key is unsafe')
-  }
-}
-
-function encodePath(value) {
-  return encodeURIComponent(value).replace(/[!'()*]/gu, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)
-}
-
-function hmac(key, value) {
-  return createHmac('sha256', key).update(value).digest()
-}
-
-function sha256(bytes) {
-  return createHash('sha256').update(bytes).digest('hex')
 }
 
 function requiredEnv(name) {
