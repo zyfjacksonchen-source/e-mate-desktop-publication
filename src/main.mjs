@@ -96,6 +96,17 @@ export class GithubClient {
     this.#temporaryRoot = resolve(options.temporaryRoot)
   }
 
+  async getRepository() {
+    const value = await this.#json(`/repos/${this.#repository}`)
+    return {
+      fullName: value.full_name,
+      visibility: value.visibility,
+      defaultBranch: value.default_branch,
+      archived: value.archived,
+      disabled: value.disabled,
+    }
+  }
+
   async getBranchHead(branch) {
     const value = await this.#json(`/repos/${this.#repository}/git/ref/heads/${encodeURIComponent(branch)}`)
     return value?.object?.sha
@@ -113,6 +124,9 @@ export class GithubClient {
         contexts: [...new Set(contexts)],
       },
       enforceAdmins: value?.enforce_admins?.enabled === true,
+      requiredLinearHistory: value?.required_linear_history?.enabled === true,
+      allowForcePushes: value?.allow_force_pushes?.enabled === true,
+      allowDeletions: value?.allow_deletions?.enabled === true,
     }
   }
 

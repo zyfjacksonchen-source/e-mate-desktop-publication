@@ -20,6 +20,19 @@ const BASE_ID = `e-mate-desktop-profile-v7-dsh-${SOURCE.slice(0, 12)}`
 const KEY_ID = 'e0a81164526dcbcd'
 
 describe('external Desktop publication owner', () => {
+  it('accepts only the protected public production repository authority', async () => {
+    assert.equal(EXPECTED_REPOSITORY, 'zyfjacksonchen-source/e-Mate-2.0.11')
+    const rejected = releaseFixture()
+    rejected.config.repository = 'zyfjacksonchen-source/e-Mate'
+    await assert.rejects(rejected.publish(), /unexpected caller repository/u)
+    assert.deepEqual(rejected.store.writes, [])
+
+    const accepted = releaseFixture()
+    const receipt = await accepted.publish()
+    assert.equal(receipt.repository, 'zyfjacksonchen-source/e-Mate-2.0.11')
+    assert.equal(receipt.status, 'published')
+  })
+
   it('validates everything before writing installers, manual manifest, then the CAS pointer', async () => {
     const fixture = releaseFixture()
     const receipt = await fixture.publish()
@@ -50,6 +63,8 @@ describe('external Desktop publication owner', () => {
   it('fails closed before the first write for provenance, trust, bytes, schema, or tombstone drift', async t => {
     const cases = [
       ['unprotected main', fixture => { fixture.github.protection.enforceAdmins = false }],
+      ['force-pushable main', fixture => { fixture.github.protection.allowForcePushes = true }],
+      ['private production repository', fixture => { fixture.github.repository.visibility = 'private' }],
       ['failed CI job', fixture => { fixture.github.jobs.get('100')[0].conclusion = 'failure' }],
       ['Base trust-key drift', fixture => {
         const base = JSON.parse(fixture.github.file('201', 'base-contract.json').buffer)
@@ -382,7 +397,20 @@ function releaseFixture() {
 class FakeGithub {
   constructor({ source, artifacts }) {
     this.source = source
-    this.protection = { requiredStatusChecks: { strict: true, contexts: ['CI admission'] }, enforceAdmins: true }
+    this.repository = {
+      fullName: EXPECTED_REPOSITORY,
+      visibility: 'public',
+      defaultBranch: 'main',
+      archived: false,
+      disabled: false,
+    }
+    this.protection = {
+      requiredStatusChecks: { strict: true, contexts: ['CI admission'] },
+      enforceAdmins: true,
+      requiredLinearHistory: true,
+      allowForcePushes: false,
+      allowDeletions: false,
+    }
     this.runs = new Map([
       ['100', run('100', '.github/workflows/ci.yml', 'push')],
       ['101', run('101', '.github/workflows/desktop-admission.yml', 'workflow_dispatch')],
@@ -403,6 +431,7 @@ class FakeGithub {
     this.artifacts = new Map(artifacts.map(item => [item.metadata.id, item]))
   }
 
+  async getRepository() { return structuredClone(this.repository) }
   async getBranchHead() { return this.source }
   async getBranchProtection() { return this.protection }
   async getRun(id) { return structuredClone(this.runs.get(String(id))) }

@@ -8,7 +8,7 @@ publishes in one fixed order.
 
 The action is deliberately pinned to:
 
-- caller repository `zyfjacksonchen-source/e-Mate`;
+- caller repository `zyfjacksonchen-source/e-Mate-2.0.11`;
 - release `2.0.13`;
 - public origin `https://pub-ada3f610c0234a76838f4e19fe2bb25e.r2.dev`;
 - legacy `desktop/latest.json` at 948 bytes / SHA-256
@@ -25,6 +25,10 @@ The caller must first use `actions/setup-node` with Node 24, then invoke this
 action from `workflow_dispatch` on `refs/heads/main`. GitHub must report
 `GITHUB_REF_PROTECTED=true`; the branch-protection API must independently show
 strict required check `CI admission` and enforcement for administrators.
+The currently verified production environment is `r2-publish`; it admits only
+protected branches. The private `zyfjacksonchen-source/e-Mate` repository is
+not a publication authority and is rejected even if it contains identical
+source bytes.
 
 The action accepts these non-secret inputs:
 
@@ -105,10 +109,10 @@ provide these variables directly on the `uses` step:
 ```yaml
 env:
   EMATE_GITHUB_PROVENANCE_TOKEN: ${{ secrets.EMATE_GITHUB_PROVENANCE_TOKEN }}
-  EMATE_DESKTOP_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.EMATE_PROFILE_SIGNING_KEY }}
-  EMATE_R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-  EMATE_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  EMATE_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  EMATE_DESKTOP_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.EMATE_PROFILE_SIGNING_PRIVATE_KEY }}
+  EMATE_R2_ACCOUNT_ID: ${{ secrets.ECOREX_R2_ACCOUNT_ID }}
+  EMATE_R2_ACCESS_KEY_ID: ${{ secrets.ECOREX_R2_ACCESS_KEY_ID }}
+  EMATE_R2_SECRET_ACCESS_KEY: ${{ secrets.ECOREX_R2_SECRET_ACCESS_KEY }}
 ```
 
 The provenance token needs only repository Actions/Contents read plus
@@ -160,6 +164,24 @@ objects; it never manufactures new bytes or a new sequence.
 
 ## Minimal e-Mate workflow wiring
 
+Read-only production-authority audit at public `main`
+`5fb9d595749ee9de4f8019ae4decce02ad3af541` on 2026-08-25:
+
+| Contract | Current public repository state |
+| --- | --- |
+| `.github/workflows/ci.yml` / `CI admission` | Present and the exact strict required check |
+| `.github/workflows/desktop-release.yml` | Present; existing build/reuse/macOS/Windows/manifest job names match this action |
+| `e-mate-desktop-release-<sha>` | Present, but currently contains old `latest.json`, not the required `desktop-candidate.json` rich candidate |
+| `.github/workflows/desktop-performance.yml` / `Performance admission` | Missing |
+| `e-mate-performance-admission-<sha>` | Missing |
+| `.github/workflows/desktop-admission.yml` / `Desktop release admission` | Missing |
+| `e-mate-desktop-admission-<sha>` | Missing |
+| `zyfjacksonchen-source/e-mate-desktop-publication` | Missing; this local commit has not been pushed |
+| `r2-publish` Environment | Present, protected-branches-only; signing key ID/private-key bindings exist |
+
+The existing Desktop publisher still writes `desktop/latest.json`. It is a
+2.0.12 publisher, not a compatible partial implementation of this action.
+
 The e-Mate repository still needs one protected admission workflow that runs
 after the exact build and performance runs. It should download those artifacts,
 run the existing `desktop-release-manifest.ts admit` producer, and upload only
@@ -179,6 +201,19 @@ admission run has completed. A separate protected-environment publish job then:
 Do not copy this action into the product repository, expose the private key to
 the checkout, or replace the exact artifact IDs with paths downloaded by an
 operator.
+
+The current public production repository does not yet contain
+`desktop-performance.yml` or `desktop-admission.yml`. Its current
+`desktop-release.yml` still emits the old `latest.json` candidate and its
+production job writes the legacy `desktop/latest.json`; that job must remain
+disabled for 2.0.13. The repository must first land the reviewed rich-candidate
+producer, frozen legacy tombstone, signed performance owner and admission
+workflows. The current `r2-publish` environment already contains the Profile
+signing key ID/private-key bindings, but no GitHub administration-read
+provenance-token binding was present at the time of this audit. Existing R2
+credential values were not inspected; they must be verified as actual
+bucket-scoped S3 credentials because this action intentionally does not carry
+the legacy bearer-token conversion fallback.
 
 ## Local verification
 

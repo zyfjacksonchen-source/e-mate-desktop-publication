@@ -6,7 +6,7 @@ import {
   verify,
 } from 'node:crypto'
 
-export const EXPECTED_REPOSITORY = 'zyfjacksonchen-source/e-Mate'
+export const EXPECTED_REPOSITORY = 'zyfjacksonchen-source/e-Mate-2.0.11'
 export const EXPECTED_ACTION_REPOSITORY = 'zyfjacksonchen-source/e-mate-desktop-publication'
 export const PUBLIC_ORIGIN = 'https://pub-ada3f610c0234a76838f4e19fe2bb25e.r2.dev'
 export const EXPECTED_R2_BUCKET = 'emate-desktop-downloads'
@@ -311,12 +311,18 @@ function validateInvocation(config) {
 }
 
 async function validateProtectedMain(github, config) {
+  const repository = await github.getRepository()
+  if (repository.fullName !== EXPECTED_REPOSITORY || repository.visibility !== 'public'
+    || repository.defaultBranch !== 'main' || repository.archived !== false || repository.disabled !== false) {
+    throw new Error('production repository authority drifted')
+  }
   const current = await github.getBranchHead('main')
   if (current !== config.sourceCommit) throw new Error('main no longer points to the admitted source commit')
   const protection = await github.getBranchProtection('main')
   if (protection?.requiredStatusChecks?.strict !== true
     || !protection.requiredStatusChecks.contexts.includes('CI admission')
-    || protection.enforceAdmins !== true) {
+    || protection.enforceAdmins !== true || protection.requiredLinearHistory !== true
+    || protection.allowForcePushes !== false || protection.allowDeletions !== false) {
     throw new Error('main is not protected by strict CI admission for administrators')
   }
 }
