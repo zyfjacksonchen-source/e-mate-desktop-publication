@@ -1,0 +1,12 @@
+{
+  "name": "e-mate-desktop-publication-action",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,54 @@
+name: e-Mate Desktop protected publication
+description: Verify, sign, and CAS-publish one exact admitted e-Mate 2.0.13 Desktop release.
+inputs:
+  source-sha:
+    description: Exact protected-main source commit bound by CI and every release artifact.
+    required: true
+  main-ci-run-id:
+    description: Successful protected-main CI run containing the CI admission job.
+    required: true
+  admission-artifact-id:
+    description: Successful protected-main desktop-admission artifact containing only the unsigned manifest and Base contract.
+    required: true
+  expected-signed-current:
+    description: Literal absent, or the exact current desktop/signed/latest.json identity as <bytes>:<sha256>.
+    required: true
+  signing-key-id:
+    description: Existing Base profile_signing_keys identity used for the domain-separated Desktop signature.
+    required: true
+  receipt-path:
+    description: Optional new local path for the non-secret CAS receipt.
+    required: false
+    default: ''
+outputs:
+  receipt-path:
+    description: Local non-secret publication receipt path.
+    value: ${{ steps.publish.outputs.receipt_path }}
+  manifest-identity:
+    description: Canonical SHA-256 identity of the signed manifest.
+    value: ${{ steps.publish.outputs.manifest_identity }}
+  manifest-sha256:
+    description: SHA-256 of the exact published signed manifest bytes.
+    value: ${{ steps.publish.outputs.manifest_sha256 }}
+  status:
+    description: published or already-published.
+    value: ${{ steps.publish.outputs.status }}
+runs:
+  using: composite
+  steps:
+    - id: publish
+      name: Verify exact provenance, sign once, and publish in fail-closed order
+      shell: bash
+      env:
+        EMATE_ACTION_REPOSITORY: ${{ github.action_repository }}
+        EMATE_ACTION_REF: ${{ github.action_ref }}
+        EMATE_SOURCE_SHA: ${{ inputs.source-sha }}
+        EMATE_MAIN_CI_RUN_ID: ${{ inputs.main-ci-run-id }}
+        EMATE_ADMISSION_ARTIFACT_ID: ${{ inputs.admission-artifact-id }}
+        EMATE_EXPECTED_SIGNED_CURRENT: ${{ inputs.expected-signed-current }}
+        EMATE_SIGNING_KEY_ID: ${{ inputs.signing-key-id }}
+        EMATE_RECEIPT_PATH: ${{ inputs.receipt-path }}
+      run: |
+        set -euo pipefail
+        test "$(node -p 'process.versions.node.split(".")[0]')" = 24
+        node "$GITHUB_ACTION_PATH/src/main.mjs"
