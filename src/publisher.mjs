@@ -28,6 +28,8 @@ export const DESKTOP_RELEASE_ARTIFACT_NAMES = Object.freeze({
   win32: `e-Mate-${RELEASE_VERSION}-win-x64-Setup.exe`,
 })
 export const DESKTOP_RELEASE_ARTIFACT_FILES = Object.freeze(Object.values(DESKTOP_RELEASE_ARTIFACT_NAMES))
+const DESKTOP_CI_RECEIPT = 'desktop-artifact-receipt.json'
+const DESKTOP_RUNTIME_RECEIPT = 'desktop-runtime-verification.json'
 export const LEGACY_TOMBSTONE = Object.freeze({
   key: 'desktop/latest.json',
   bytes: 948,
@@ -337,7 +339,11 @@ export async function prepareDesktopPublication(config, dependencies) {
     path: '.github/workflows/ci.yml',
     event: 'push',
     sourceCommit: config.sourceCommit,
-    jobs: ['CI admission'],
+    jobs: [
+      'CI admission',
+      'Windows x64 / unsigned desktop installer',
+      'macOS universal / unsigned desktop disk image',
+    ],
   })
 
   const admissionArtifact = await github.getArtifact(config.admissionArtifactId)
@@ -371,41 +377,16 @@ export async function prepareDesktopPublication(config, dependencies) {
 
   const provenance = unsigned.github_artifact_provenance
   const [candidateReference, performanceReference] = provenance.artifacts
-  if (unsigned.artifacts.darwin.build_run_id !== candidateReference.run_id) {
-    throw new Error('macOS installer build run is not the exact candidate run')
+  if (unsigned.artifacts.darwin.build_run_id !== config.mainCiRunId
+    || unsigned.artifacts.win32.build_run_id !== config.mainCiRunId) {
+    throw new Error('Desktop installers are not owned by the exact protected-main CI run')
   }
-  const reusedWindowsRunId = unsigned.artifacts.win32.build_run_id === candidateReference.run_id
-    ? undefined
-    : unsigned.artifacts.win32.build_run_id
   const candidateArtifact = await validateProvenanceArtifact(github, candidateReference, {
     path: '.github/workflows/desktop-release.yml',
     event: 'workflow_dispatch',
     sourceCommit: config.sourceCommit,
-    jobs: reusedWindowsRunId === undefined
-      ? [
-          'Build and verify the e-Mate profile',
-          'Build unsigned Windows x64 installer',
-          'Build unsigned macOS universal disk image',
-          'Bind native artifacts to the release manifest',
-        ]
-      : [
-          'Validate reusable profile and Windows artifacts',
-          'Build unsigned macOS universal disk image',
-          'Bind native artifacts to the release manifest',
-        ],
+    jobs: ['Bind exact protected-main CI artifacts to the release manifest'],
   })
-  if (reusedWindowsRunId !== undefined) {
-    await validateRun(github, reusedWindowsRunId, {
-      path: '.github/workflows/desktop-release.yml',
-      event: 'workflow_dispatch',
-      sourceCommit: config.sourceCommit,
-      requireSuccessfulRun: false,
-      jobs: [
-        'Build and verify the e-Mate profile',
-        'Build unsigned Windows x64 installer',
-      ],
-    })
-  }
   const performanceArtifact = await validateProvenanceArtifact(github, performanceReference, {
     path: '.github/workflows/desktop-performance.yml',
     event: 'workflow_dispatch',
@@ -432,26 +413,24 @@ export async function prepareDesktopPublication(config, dependencies) {
       throw new Error(`GitHub ${platform} installer bytes do not match the admitted manifest`)
     }
     const stagingArtifactId = platform === 'darwin' ? config.macosArtifactId : config.windowsArtifactId
-    const stagingRunId = platform === 'darwin' ? candidateReference.run_id : expected.build_run_id
     const stagingName = `e-mate-desktop-${platform === 'darwin' ? 'macos' : 'windows'}-${config.sourceCommit}`
     const stagingArtifact = await github.getArtifact(stagingArtifactId)
     assertArtifactMetadata(stagingArtifact, {
       id: stagingArtifactId,
       name: stagingName,
-      runId: stagingRunId,
+      runId: config.mainCiRunId,
     })
     const stagingBundle = await github.downloadArtifact(stagingArtifactId)
     assertDownloadedArtifact(stagingBundle, stagingArtifact)
     assertNoMacSmoke(stagingBundle.files)
-    assertExactFileSet(stagingBundle.files, [artifactNames[platform]])
-    if (typeof stagingBundle.storedEntries !== 'function'
-      || !(await stagingBundle.storedEntries()).has(artifactNames[platform])) {
-      throw new Error(`GitHub ${platform} staging artifact is not a compression-level-0 stored entry`)
-    }
-    const stagingSource = requiredFile(stagingBundle.files, artifactNames[platform])
-    if (stagingSource.bytes !== expected.bytes || await stagingSource.digest() !== expected.sha256) {
-      throw new Error(`GitHub ${platform} staging artifact does not match the final candidate bytes`)
-    }
+    await validateDesktopCiStagingArtifact(stagingBundle, {
+      platform,
+      installerName: artifactNames[platform],
+      expected,
+      sourceCommit: config.sourceCommit,
+      ciRunId: config.mainCiRunId,
+      base,
+    })
     stagingArtifacts[platform] = {
       id: String(stagingArtifact.id),
       name: stagingArtifact.name,
@@ -789,6 +768,67 @@ function assertArtifactMetadata(actual, expected) {
 function assertDownloadedArtifact(bundle, metadata) {
   if (bundle.archiveSha256 !== metadata.digest.slice('sha256:'.length)) {
     throw new Error(`downloaded GitHub artifact ${metadata.id} digest drifted`)
+  }
+}
+
+async function validateDesktopCiStagingArtifact(bundle, context) {
+  const blockmapName = `${context.installerName}.blockmap`
+  const actual = [...bundle.files.keys()].sort()
+  const required = [context.installerName, DESKTOP_RUNTIME_RECEIPT, DESKTOP_CI_RECEIPT]
+  if (![required, [...required, blockmapName]].some(files => canonicalJson([...files].sort()) === canonicalJson(actual))) {
+    throw new Error(`GitHub ${context.platform} staging artifact file set drifted: ${actual.join(', ')}`)
+  }
+  if (typeof bundle.storedEntries !== 'function') {
+    throw new Error(`GitHub ${context.platform} staging artifact has no compression receipt`)
+  }
+  const stored = await bundle.storedEntries()
+  if (!(stored instanceof Set) || actual.some(name => !stored.has(name))) {
+    throw new Error(`GitHub ${context.platform} staging artifact is not entirely compression-level-0 stored`)
+  }
+
+  const receipt = parsePrettyJson(
+    await readSmall(requiredFile(bundle.files, DESKTOP_CI_RECEIPT)),
+    `GitHub ${context.platform} Desktop CI artifact receipt`,
+  )
+  const expectedFiles = actual.filter(name => name !== DESKTOP_CI_RECEIPT)
+  if (!hasExactKeys(receipt, [
+    'schema_version', 'document_type', 'platform', 'source_commit', 'ci_run_id', 'base_contract_id', 'files',
+  ]) || receipt.schema_version !== 1 || receipt.document_type !== 'emate.desktop-ci-artifact'
+    || receipt.platform !== context.platform || receipt.source_commit !== context.sourceCommit
+    || receipt.ci_run_id !== context.ciRunId || receipt.base_contract_id !== context.base.id
+    || !Array.isArray(receipt.files) || receipt.files.length !== expectedFiles.length) {
+    throw new Error(`GitHub ${context.platform} Desktop CI artifact receipt is invalid`)
+  }
+  const descriptorNames = receipt.files.map(item => item?.name).sort()
+  if (canonicalJson(descriptorNames) !== canonicalJson(expectedFiles)) {
+    throw new Error(`GitHub ${context.platform} Desktop CI artifact receipt file set drifted`)
+  }
+  for (const descriptor of receipt.files) {
+    if (!hasExactKeys(descriptor, ['name', 'bytes', 'sha256']) || typeof descriptor.name !== 'string'
+      || !positiveInteger(descriptor.bytes) || !SHA256.test(descriptor.sha256 ?? '')) {
+      throw new Error(`GitHub ${context.platform} Desktop CI artifact file receipt is invalid`)
+    }
+    const source = requiredFile(bundle.files, descriptor.name)
+    if (source.bytes !== descriptor.bytes || await source.digest() !== descriptor.sha256) {
+      throw new Error(`GitHub ${context.platform} Desktop CI artifact file drifted: ${descriptor.name}`)
+    }
+  }
+
+  const runtime = parsePrettyJson(
+    await readSmall(requiredFile(bundle.files, DESKTOP_RUNTIME_RECEIPT)),
+    `GitHub ${context.platform} Desktop runtime verification receipt`,
+  )
+  const format = context.platform === 'darwin' ? 'udif' : 'pe'
+  if (!hasExactKeys(runtime, [
+    'schema_version', 'document_type', 'platform', 'source_commit', 'ci_run_id', 'base_contract_id', 'harness_commit', 'installer',
+  ]) || runtime.schema_version !== 1 || runtime.document_type !== 'emate.desktop-runtime-verification'
+    || runtime.platform !== context.platform || runtime.source_commit !== context.sourceCommit
+    || runtime.ci_run_id !== context.ciRunId || runtime.base_contract_id !== context.base.id
+    || runtime.harness_commit !== context.base.harness_commit
+    || !hasExactKeys(runtime.installer, ['name', 'bytes', 'sha256', 'format'])
+    || runtime.installer.name !== context.installerName || runtime.installer.bytes !== context.expected.bytes
+    || runtime.installer.sha256 !== context.expected.sha256 || runtime.installer.format !== format) {
+    throw new Error(`GitHub ${context.platform} Desktop runtime verification receipt is invalid`)
   }
 }
 
