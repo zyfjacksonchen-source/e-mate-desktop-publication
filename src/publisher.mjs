@@ -15,7 +15,15 @@ export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-man
 export const PERFORMANCE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-admission-v1\0', 'utf8')
 export const PERFORMANCE_EVIDENCE_FILENAME = 'e-mate-performance-evidence.json'
 export const PERFORMANCE_VERIFIER_SOURCE = 'scripts/performance-parity.mjs'
+export const PROFILE_COMPONENT_AGGREGATE_FILENAME = 'profile-component-aggregate.json'
 export const MAX_PERFORMANCE_FILE_BYTES = 64 * 1024 * 1024
+const PROFILE_AGGREGATE_CONTEXT = Buffer.from('e-mate-profile-aggregate-v1\0', 'utf8')
+export const DESKTOP_RELEASE_ARTIFACT_NAMES = Object.freeze({
+  candidate: 'desktop-candidate.json',
+  darwin: `e-Mate-${RELEASE_VERSION}-mac-universal.dmg`,
+  win32: `e-Mate-${RELEASE_VERSION}-win-x64-Setup.exe`,
+})
+export const DESKTOP_RELEASE_ARTIFACT_FILES = Object.freeze(Object.values(DESKTOP_RELEASE_ARTIFACT_NAMES))
 export const LEGACY_TOMBSTONE = Object.freeze({
   key: 'desktop/latest.json',
   bytes: 948,
@@ -77,34 +85,16 @@ export async function createPerformanceAdmission(config, dependencies) {
   const desktopBundle = await github.downloadArtifact(config.desktopArtifactId)
   assertDownloadedArtifact(desktopBundle, desktopArtifact)
   assertNoMacSmoke(desktopBundle.files)
-  const artifactNames = {
-    darwin: `e-Mate-${RELEASE_VERSION}-mac-universal.dmg`,
-    win32: `e-Mate-${RELEASE_VERSION}-win-x64-Setup.exe`,
-  }
-  assertExactFileSet(desktopBundle.files, [
-    'base-contract.json',
-    'desktop-candidate.json',
-    'profile-component-aggregate.json',
-    artifactNames.darwin,
-    artifactNames.win32,
-  ])
+  const artifactNames = DESKTOP_RELEASE_ARTIFACT_NAMES
+  assertExactFileSet(desktopBundle.files, DESKTOP_RELEASE_ARTIFACT_FILES)
   const candidate = parsePrettyJson(
-    await readSmall(requiredFile(desktopBundle.files, 'desktop-candidate.json')),
+    await readSmall(requiredFile(desktopBundle.files, artifactNames.candidate)),
     'Desktop artifact candidate',
   )
-  const baseBytes = await readSmall(requiredFile(desktopBundle.files, 'base-contract.json'))
+  const baseBytes = await github.getFile('desktop/e-mate-desktop/base-contract.json', config.sourceCommit)
+  if (!Buffer.isBuffer(baseBytes)) throw new Error('Desktop Base contract source is invalid')
   const base = parseJson(baseBytes, 'Desktop Base contract')
-  const profileComponentAggregate = parsePrettyJson(
-    await readSmall(requiredFile(desktopBundle.files, 'profile-component-aggregate.json')),
-    'Profile component aggregate',
-  )
   validatePerformanceCandidate(candidate, config.sourceCommit, base)
-  if (!profileAggregate(profileComponentAggregate)) throw new Error('Profile component aggregate is invalid')
-
-  const trustedBaseBytes = await github.getFile('desktop/e-mate-desktop/base-contract.json', config.sourceCommit)
-  if (!Buffer.isBuffer(trustedBaseBytes) || !baseBytes.equals(trustedBaseBytes)) {
-    throw new Error('Desktop Base contract is not the exact protected-main source file')
-  }
   validateBaseAndSigningKey(base, {
     baseContractId: base.id,
     scheduleProtocolFloor: candidate.schedule_protocol_floor,
@@ -152,17 +142,25 @@ export async function createPerformanceAdmission(config, dependencies) {
     }
   }
 
+  const profileReleaseArtifact = await github.getArtifact(config.profileReleaseArtifactId)
+  assertArtifactMetadata(profileReleaseArtifact, {
+    id: config.profileReleaseArtifactId,
+    name: `e-mate-profile-native-cloudflare-publication-${config.sourceCommit}`,
+    runId: config.profileReleaseRunId,
+  })
+  await validateRun(github, config.profileReleaseRunId, {
+    path: '.github/workflows/profile-release.yml',
+    event: 'workflow_dispatch',
+    sourceCommit: config.sourceCommit,
+    jobs: ['Prepare signed native Cloudflare publication bundle'],
+  })
+
   const evidenceArtifact = await github.getArtifact(config.evidenceArtifactId)
   assertArtifactMetadata(evidenceArtifact, {
     id: config.evidenceArtifactId,
-    name: `e-mate-performance-evidence-${config.sourceCommit}`,
+    name: performanceEvidenceArtifactName(config.sourceCommit, config.currentRunAttempt),
   })
-  await validateRun(github, evidenceArtifact.runId, {
-    path: '.github/workflows/desktop-performance.yml',
-    event: 'workflow_dispatch',
-    sourceCommit: config.sourceCommit,
-    jobs: ['TTFT evidence'],
-  })
+  await validateCurrentPerformanceRun(github, evidenceArtifact.runId, config)
   const evidenceBundle = await github.downloadArtifact(config.evidenceArtifactId)
   assertDownloadedArtifact(evidenceBundle, evidenceArtifact)
   assertNoMacSmoke(evidenceBundle.files)
@@ -172,7 +170,16 @@ export async function createPerformanceAdmission(config, dependencies) {
   ))
   const inputEvidence = parsePrettyJson(inputEvidenceBytes, 'performance evidence')
   const expectedEvidenceFiles = performanceEvidenceFiles(inputEvidence)
-  assertExactFileSet(evidenceBundle.files, [PERFORMANCE_VERIFIER_SOURCE, ...expectedEvidenceFiles])
+  assertExactFileSet(evidenceBundle.files, [
+    PERFORMANCE_VERIFIER_SOURCE,
+    PROFILE_COMPONENT_AGGREGATE_FILENAME,
+    ...expectedEvidenceFiles,
+  ])
+  const profileComponentAggregate = parsePrettyJson(
+    await readSmall(requiredFile(evidenceBundle.files, PROFILE_COMPONENT_AGGREGATE_FILENAME)),
+    'Profile component aggregate',
+  )
+  if (!profileAggregate(profileComponentAggregate)) throw new Error('Profile component aggregate is invalid')
 
   const verifierSource = requiredFile(evidenceBundle.files, PERFORMANCE_VERIFIER_SOURCE)
   const verifierBytes = await readPerformanceFile(verifierSource)
@@ -233,7 +240,7 @@ export async function createPerformanceAdmission(config, dependencies) {
   }
   assertExactFileSet(outputFiles, ['performance-admission.json', ...expectedEvidenceFiles])
   return {
-    artifactName: `e-mate-performance-admission-${config.sourceCommit}`,
+    artifactName: performanceAdmissionArtifactName(config.sourceCommit, config.currentRunAttempt),
     files: outputFiles,
     performanceRunId: evidence.performance_run_id,
     admissionSha256: sha256(admissionBytes),
@@ -329,17 +336,10 @@ export async function publishDesktopRelease(config, dependencies) {
   const candidateBundle = await github.downloadArtifact(candidateReference.artifact_id)
   assertDownloadedArtifact(candidateBundle, candidateArtifact)
   assertNoMacSmoke(candidateBundle.files)
-  const artifactNames = {
-    darwin: `e-Mate-${RELEASE_VERSION}-mac-universal.dmg`,
-    win32: `e-Mate-${RELEASE_VERSION}-win-x64-Setup.exe`,
-  }
-  assertExactFileSet(candidateBundle.files, [
-    'desktop-candidate.json',
-    artifactNames.darwin,
-    artifactNames.win32,
-  ])
+  const artifactNames = DESKTOP_RELEASE_ARTIFACT_NAMES
+  assertExactFileSet(candidateBundle.files, DESKTOP_RELEASE_ARTIFACT_FILES)
   const candidate = parsePrettyJson(
-    await readSmall(requiredFile(candidateBundle.files, 'desktop-candidate.json')),
+    await readSmall(requiredFile(candidateBundle.files, artifactNames.candidate)),
     'Desktop artifact candidate',
   )
   validateCandidate(candidate, unsigned)
@@ -531,7 +531,9 @@ function validatePerformanceInvocation(config) {
   if (!SHA40.test(config.sourceCommit) || config.githubSha !== config.sourceCommit) {
     throw new Error('caller source commit is invalid or does not match GITHUB_SHA')
   }
-  if (![config.mainCiRunId, config.desktopArtifactId, config.evidenceArtifactId].every(value => RUN_ID.test(value ?? ''))) {
+  if (![config.mainCiRunId, config.currentRunId, config.currentRunAttempt, config.desktopArtifactId,
+    config.profileReleaseRunId, config.profileReleaseArtifactId, config.evidenceArtifactId]
+    .every(value => RUN_ID.test(value ?? ''))) {
     throw new Error('performance admission GitHub identity is invalid')
   }
   if (typeof config.signingKeyId !== 'string' || config.signingKeyId === '') {
@@ -563,7 +565,7 @@ async function validateRun(github, runId, expected) {
     || expected.requireSuccessfulRun !== false && run.conclusion !== 'success'
     || run.headSha !== expected.sourceCommit || run.headBranch !== 'main'
     || run.path !== expected.path || run.event !== expected.event
-    || !Number.isSafeInteger(run.runAttempt) || run.runAttempt <= 0) {
+    || run.runAttempt !== 1) {
     throw new Error(`GitHub run ${runId} is not the exact successful protected-main ${expected.path} run`)
   }
   const jobs = await github.getRunJobs(String(runId))
@@ -571,6 +573,26 @@ async function validateRun(github, runId, expected) {
     if (!jobs.some(job => job.name === name && job.status === 'completed' && job.conclusion === 'success')) {
       throw new Error(`GitHub run ${runId} is missing successful job ${name}`)
     }
+  }
+  return run
+}
+
+async function validateCurrentPerformanceRun(github, runId, config) {
+  if (String(runId) !== config.currentRunId) {
+    throw new Error('performance evidence artifact is not from the current workflow run')
+  }
+  const run = await github.getRun(config.currentRunId)
+  if (config.currentRunAttempt !== '1' || String(run.id) !== config.currentRunId
+    || run.status !== 'in_progress' || run.conclusion !== null
+    || run.headSha !== config.sourceCommit || run.headBranch !== 'main'
+    || run.path !== '.github/workflows/desktop-performance.yml' || run.event !== 'workflow_dispatch'
+    || run.runAttempt !== 1) {
+    throw new Error('performance evidence artifact is not from the exact current protected-main run attempt')
+  }
+  const jobs = await github.getRunJobs(config.currentRunId)
+  if (!jobs.some(job => job.name === 'TTFT evidence'
+    && job.status === 'completed' && job.conclusion === 'success')) {
+    throw new Error('current performance run is missing successful TTFT evidence')
   }
   return run
 }
@@ -764,14 +786,19 @@ function validatePerformanceAdmission(admission, rawBytes, manifest, publicKey, 
 }
 
 function profileAggregate(value) {
-  return hasExactKeys(value, ['aggregate_sha256', 'inventory_sha256', 'staged_profile_tree_sha256', 'targets'])
-    && SHA256.test(value.aggregate_sha256 ?? '') && SHA256.test(value.inventory_sha256 ?? '')
-    && SHA256.test(value.staged_profile_tree_sha256 ?? '') && Array.isArray(value.targets)
-    && value.targets.length === TARGETS.length
-    && value.targets.every((target, index) => hasExactKeys(target, [
+  if (!hasExactKeys(value, ['aggregate_sha256', 'inventory_sha256', 'staged_profile_tree_sha256', 'targets'])
+    || !SHA256.test(value.aggregate_sha256 ?? '') || !SHA256.test(value.inventory_sha256 ?? '')
+    || !SHA256.test(value.staged_profile_tree_sha256 ?? '') || !Array.isArray(value.targets)
+    || value.targets.length !== TARGETS.length
+    || !value.targets.every((target, index) => hasExactKeys(target, [
       'target', 'profile_generation', 'component_aggregate_sha256',
     ]) && target.target === TARGETS[index] && SHA256.test(target.profile_generation ?? '')
-      && SHA256.test(target.component_aggregate_sha256 ?? ''))
+      && SHA256.test(target.component_aggregate_sha256 ?? ''))) return false
+  const { aggregate_sha256: digest, ...unsigned } = value
+  return digest === sha256(Buffer.concat([
+    PROFILE_AGGREGATE_CONTEXT,
+    Buffer.from(canonicalJson(unsigned), 'utf8'),
+  ]))
 }
 
 function performanceSummary(value) {
@@ -810,6 +837,7 @@ function performanceEvidenceFiles(evidence) {
         || !safeArtifactPath(descriptor.path) || !SHA256.test(descriptor.sha256 ?? '')
         || descriptor.path === PERFORMANCE_EVIDENCE_FILENAME
         || descriptor.path === PERFORMANCE_VERIFIER_SOURCE
+        || descriptor.path === PROFILE_COMPONENT_AGGREGATE_FILENAME
         || descriptor.path === 'performance-admission.json'
         || seen.has(descriptor.path)) {
         throw new Error(`performance evidence ${field} descriptor is invalid`)
@@ -881,9 +909,9 @@ function githubProvenance(value, sourceCommit) {
     ]) && artifact.role === roles[index]
       && artifact.name === (index === 0
         ? `e-mate-desktop-release-${sourceCommit}`
-        : `e-mate-performance-admission-${sourceCommit}`)
+        : performanceAdmissionArtifactName(sourceCommit, artifact.run_attempt))
       && RUN_ID.test(artifact.artifact_id ?? '') && /^sha256:[0-9a-f]{64}$/u.test(artifact.digest ?? '')
-      && RUN_ID.test(artifact.run_id ?? '') && positiveInteger(artifact.run_attempt))
+      && RUN_ID.test(artifact.run_id ?? '') && artifact.run_attempt === 1)
 }
 
 async function assertLegacyTombstone(store, publicReader) {
@@ -1084,6 +1112,20 @@ export function signPerformanceAdmission(unsigned, privateKeyPem, keyId) {
     privateKey,
   ).toString('base64')
   return { ...unsigned, signature: { algorithm: 'ed25519', key_id: keyId, value } }
+}
+
+export function performanceEvidenceArtifactName(sourceCommit, runAttempt) {
+  return performanceArtifactName('evidence', sourceCommit, runAttempt)
+}
+
+export function performanceAdmissionArtifactName(sourceCommit, runAttempt) {
+  return performanceArtifactName('admission', sourceCommit, runAttempt)
+}
+
+function performanceArtifactName(kind, sourceCommit, runAttempt) {
+  if (!['evidence', 'admission'].includes(kind) || !SHA40.test(sourceCommit)
+    || String(runAttempt) !== '1') throw new Error('performance artifact identity is invalid')
+  return `e-mate-performance-${kind}-${sourceCommit}-attempt-${runAttempt}`
 }
 
 export function parseExpectedCurrent(value) {

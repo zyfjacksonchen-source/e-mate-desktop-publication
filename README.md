@@ -1,10 +1,13 @@
 # e-Mate Desktop protected publication action
 
-This repository is the external production owner for the first signed e-Mate
-Desktop feed. It does not build, test, relabel, or discover release bytes. It
-self-downloads exact GitHub Actions artifacts, validates all identities before
-the first R2 write, adds only the domain-separated Ed25519 signature, and
-publishes in one fixed order.
+The supported entrypoint in this repository is the protected performance
+admission action. It verifies exact GitHub evidence and adds only a
+domain-separated Ed25519 signature; it does not publish.
+
+The root action still contains a direct S3/R2 publication path. It is not an
+authorized production implementation: the connected Codex Cloudflare plugin is
+the sole production R2 writer. The root publication path must be removed before
+this repository can be treated as a production publication owner.
 
 The action is deliberately pinned to:
 
@@ -19,7 +22,7 @@ The action is deliberately pinned to:
 A future release or repository move requires a reviewed action commit. There is
 no generic release switch.
 
-## Required caller state
+## Blocked legacy root consumer contract
 
 The caller must first use `actions/setup-node` with Node 24, then invoke this
 action from `workflow_dispatch` on `refs/heads/main`. GitHub must report
@@ -55,10 +58,11 @@ desktop-release-unsigned.json
 the e-Mate admission producer. Its two GitHub provenance rows point to:
 
 1. `e-mate-desktop-release-<sha>`, produced by the successful build workflow and
-   containing exactly the performance-pending candidate plus the formal DMG and
+   containing exactly the performance-pending candidate, formal DMG and
    Setup.exe; and
-2. `e-mate-performance-admission-<sha>`, produced by the successful performance
-   workflow and containing one `performance-admission.json` plus its evidence.
+2. `e-mate-performance-admission-<sha>-attempt-1`, produced by the
+   successful performance workflow and containing one
+   `performance-admission.json` plus its evidence.
 
 The action downloads both by artifact ID, matches the GitHub API digest, run,
 attempt, workflow, branch, source commit and required successful jobs, then
@@ -107,41 +111,56 @@ The independent action entrypoint is
 `zyfjacksonchen-source/e-mate-desktop-publication/performance@<40-character-commit>`.
 It verifies and signs evidence only; it has no R2 client or publication step.
 In addition to `source-sha`, `main-ci-run-id` and `signing-key-id`, it accepts
-only the exact GitHub artifact IDs `desktop-artifact-id` and
-`evidence-artifact-id`. It never accepts a caller path or caller-reported
-artifact digest.
+the exact GitHub identities `desktop-artifact-id`, `profile-release-run-id`,
+`profile-artifact-id`, and `evidence-artifact-id`. It never accepts a caller
+path or caller-reported artifact digest.
 
 The downloaded `e-mate-desktop-release-<sha>` artifact must contain exactly:
 
 ```text
-base-contract.json
 desktop-candidate.json
-profile-component-aggregate.json
 e-Mate-2.0.13-mac-universal.dmg
 e-Mate-2.0.13-win-x64-Setup.exe
 ```
 
-The Base bytes must also equal the file read independently from protected-main
-GitHub Contents. Both installer hashes and byte counts must equal the candidate;
-the generated Profile aggregate must have the existing target schema. The
-action accepts the repository's single same-source native retry contract, but
-validates both the final run and the exact original Windows run.
+The Base is read independently from protected-main GitHub Contents. Both
+installer hashes and byte counts must equal the candidate. The action accepts
+the repository's single same-source native retry contract, but validates both
+the final run and the exact original Windows run.
 
-The downloaded `e-mate-performance-evidence-<sha>` artifact must contain the
-root `e-mate-performance-evidence.json`, the exact protected-main
-`scripts/performance-parity.mjs`, and exactly the unique relative evidence files
-named by the three native run receipts. The action compares the verifier bytes
-with GitHub Contents, runs that verifier under Node 24 with a secret-free child
-environment, and accepts only `production-real-provider` evidence whose gate is
-`passed`, whose production artifacts were verified, and whose Base, target
-Profile generation, composition and installed package bytes match the build
-artifact.
+The Profile artifact must be the exact
+`e-mate-profile-native-cloudflare-publication-<sha>` artifact from a completed,
+successful `.github/workflows/profile-release.yml` run whose job `Prepare signed
+native Cloudflare publication bundle` succeeded.
+
+The downloaded `e-mate-performance-evidence-<sha>-attempt-1` artifact must
+contain the root `e-mate-performance-evidence.json`, the exact protected-main
+`scripts/performance-parity.mjs`, `profile-component-aggregate.json`, and
+exactly the unique relative evidence files named by the three native run
+receipts. The aggregate is the four-field output independently recomputed by
+protected-main `scripts/desktop-admission.mjs`; the signer requires its exact
+closed schema and recomputes its domain-separated `aggregate_sha256`. The action
+compares the verifier bytes with GitHub Contents, runs that verifier under Node
+24 with a secret-free child environment, and accepts only
+`production-real-provider` evidence whose gate is `passed`, whose production
+artifacts were verified, and whose Base, target Profile generation, composition
+and installed package bytes match the build artifact.
+
+The evidence artifact must belong to the action's own `GITHUB_RUN_ID` and
+`GITHUB_RUN_ATTEMPT`, and both must identify attempt 1. While the signer job is
+executing, that workflow run must still be `in_progress`, but its `TTFT
+evidence` job must already be completed and successful. A completed prior run,
+a different run, or an artifact named for an older attempt is rejected. Every
+admitted CI, Desktop, Profile, performance and admission run must also be
+attempt 1; a failed run requires a new dispatch and run ID, not GitHub rerun.
+The publication consumer later requires this run to be completed successfully
+with its `Performance admission` job successful.
 
 The returned action-owned directory is uploaded as
-`e-mate-performance-admission-<sha>`. Its exact file set is root
-`performance-admission.json`, root `e-mate-performance-evidence.json`, and the
-evidence files referenced by the run receipts—nothing else. The verifier is the
-following exact eight-field object inside the signed 11-field admission:
+`e-mate-performance-admission-<sha>-attempt-1`. Its exact file set is
+root `performance-admission.json`, root `e-mate-performance-evidence.json`, and
+the evidence files referenced by the run receipts—nothing else. The verifier is
+the following exact eight-field object inside the signed 11-field admission:
 
 ```json
 {
@@ -170,62 +189,28 @@ provide these variables directly on the `uses` step:
 env:
   EMATE_GITHUB_PROVENANCE_TOKEN: ${{ secrets.EMATE_GITHUB_PROVENANCE_TOKEN }}
   EMATE_DESKTOP_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.EMATE_PROFILE_SIGNING_PRIVATE_KEY }}
-  EMATE_R2_ACCOUNT_ID: ${{ secrets.ECOREX_R2_ACCOUNT_ID }}
-  EMATE_R2_ACCESS_KEY_ID: ${{ secrets.ECOREX_R2_ACCESS_KEY_ID }}
-  EMATE_R2_SECRET_ACCESS_KEY: ${{ secrets.ECOREX_R2_SECRET_ACCESS_KEY }}
 ```
 
-The `/performance` entrypoint receives only
-`EMATE_GITHUB_PROVENANCE_TOKEN` and
-`EMATE_DESKTOP_SIGNING_PRIVATE_KEY_PEM`; it neither requires nor reads the R2
-variables.
-
-The provenance token needs only repository Actions/Contents read plus
-Administration read for the branch-protection check. R2 credentials must be
-scoped to the one pinned bucket. The action never prints these values, places
-them in command arguments, writes them to the receipt, or forwards them to
-GitHub artifacts. The signing key is used only in memory. Native child processes
-receive an allow-listed environment, so the signer and R2 secrets are not
-inherited by `gh` or `unzip`. GitHub artifacts are fetched with `gh` through
-`GH_TOKEN`; R2 uses Node 24 `fetch` plus a local SigV4 implementation.
+The `/performance` entrypoint neither requires nor reads `EMATE_R2_*`. The
+provenance token needs only repository Actions/Contents read plus Administration
+read for the branch-protection check. The action never prints either secret,
+places it in command arguments, writes it to the output artifact, or forwards
+it to the verifier child. The signing key is used only in memory.
 
 ## Threat boundary
 
-The action trusts only GitHub's API/TLS identity, a protected-main source and
-successful required jobs, the admitted Base trust root, the protected signing
-key, bucket-scoped R2 credentials, and exact caller-supplied run/artifact/current
-pointer identities. Caller paths, checkout files, tags, branch-named action
-references, artifact prose, provider claims, existing mutable objects and public
-HTTP status alone are not authorities.
+The performance action trusts only GitHub's API/TLS identity, protected-main
+source, exact attempt-1 successful jobs and artifacts, the Base trust root, and
+the protected signing key. Caller paths, checkout files, tags, branch-named
+action references, artifact prose, provider claims and public HTTP status are
+not authorities.
 
-The root publication entrypoint does not build or repair candidates, rerun performance checks, choose a Base,
-rotate keys, migrate legacy clients, publish Profile desired state, update a
-website, or roll back an activated release. Losing GitHub administration-read,
-artifact digest support, public full-byte readback, conditional R2 writes or an
-exact Base key is a hard stop, not a fallback.
+## Blocked legacy root entrypoint
 
-## Fixed write protocol
-
-All GitHub, manifest, Base, signing-key, performance, installer, legacy
-tombstone, manual-key and expected-pointer checks complete before the first
-write. Authenticated R2 and public reads must agree.
-
-1. Create missing immutable DMG and Setup.exe keys with `If-None-Match: *`.
-   Existing keys are accepted only when bytes, SHA-256, content type and cache
-   policy are identical.
-2. Create `desktop/manual/v2.0.13/latest.json` with `If-None-Match: *`. An
-   identical existing object is an idempotent resume; different bytes fail.
-3. Read the installers and manual manifest through the public origin and verify
-   full byte counts and SHA-256. Re-read the frozen legacy tombstone and the
-   expected signed pointer.
-4. Activate `desktop/signed/latest.json` with an S3 conditional PUT and
-   `Cache-Control: no-store`.
-5. Read the active pointer and legacy tombstone again. Emit a non-secret CAS
-   receipt.
-
-There is no write operation for `desktop/latest.json`. Any mismatch or partial
-failure stops before pointer activation. A retry resumes the same immutable
-objects; it never manufactures new bytes or a new sequence.
+`action.yml` and `src/main.mjs` still contain a direct S3/R2 writer. This is a
+release blocker, not a supported fallback or publishable implementation. It
+must be deleted; production uploads, readback and activation belong exclusively
+to the connected Codex Cloudflare plugin.
 
 ## Minimal e-Mate workflow wiring
 
@@ -238,7 +223,7 @@ Read-only production-authority audit at public `main`
 | `.github/workflows/desktop-release.yml` | Present; existing build/reuse/macOS/Windows/manifest job names match this action |
 | `e-mate-desktop-release-<sha>` | Present, but currently contains old `latest.json`, not the required `desktop-candidate.json` rich candidate |
 | `.github/workflows/desktop-performance.yml` / `Performance admission` | Missing |
-| `e-mate-performance-admission-<sha>` | Missing |
+| `e-mate-performance-admission-<sha>-attempt-1` | Missing |
 | `.github/workflows/desktop-admission.yml` / `Desktop release admission` | Missing |
 | `e-mate-desktop-admission-<sha>` | Missing |
 | `zyfjacksonchen-source/e-mate-desktop-publication` | Missing; this local commit has not been pushed |
@@ -254,14 +239,9 @@ run the existing `desktop-release-manifest.ts admit` producer, and upload only
 `e-mate-desktop-admission-${GITHUB_SHA}`. It must expose a single successful job
 named `Desktop release admission`.
 
-The blocked `r2` job in `desktop-release.yml` should remain blocked until that
-admission run has completed. A separate protected-environment publish job then:
-
-1. sets up Node 24;
-2. invokes this repository at an exact reviewed commit;
-3. supplies the five protected secret variables above and the five non-secret
-   admission inputs; and
-4. uploads only the returned non-secret receipt for audit.
+The blocked `r2` job in `desktop-release.yml` must remain blocked. After every
+admission gate succeeds, the connected Codex Cloudflare plugin is the sole
+production upload, readback and activation authority.
 
 Do not copy this action into the product repository, expose the private key to
 the checkout, or replace the exact artifact IDs with paths downloaded by an
@@ -275,10 +255,8 @@ disabled for 2.0.13. The repository must first land the reviewed rich-candidate
 producer, frozen legacy tombstone, signed performance owner and admission
 workflows. The current `r2-publish` environment already contains the Profile
 signing key ID/private-key bindings, but no GitHub administration-read
-provenance-token binding was present at the time of this audit. Existing R2
-credential values were not inspected; they must be verified as actual
-bucket-scoped S3 credentials because this action intentionally does not carry
-the legacy bearer-token conversion fallback.
+provenance-token binding was present at the time of this audit. No R2 credential
+is required or accepted by the supported performance action.
 
 ## Local verification
 

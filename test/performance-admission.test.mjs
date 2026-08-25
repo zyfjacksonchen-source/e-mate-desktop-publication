@@ -7,13 +7,17 @@ import { describe, it } from 'node:test'
 import {
   EXPECTED_ACTION_REPOSITORY,
   EXPECTED_REPOSITORY,
+  DESKTOP_RELEASE_ARTIFACT_FILES,
   PERFORMANCE_EVIDENCE_FILENAME,
   PERFORMANCE_SIGNATURE_CONTEXT,
   PERFORMANCE_VERIFIER_SOURCE,
+  PROFILE_COMPONENT_AGGREGATE_FILENAME,
   PUBLIC_ORIGIN,
   bufferSource,
   canonicalJson,
   createPerformanceAdmission,
+  performanceAdmissionArtifactName,
+  performanceEvidenceArtifactName,
 } from '../src/publisher.mjs'
 import { runPerformanceVerifier } from '../src/performance-main.mjs'
 
@@ -26,7 +30,7 @@ describe('external performance admission owner', () => {
   it('signs only exact protected-main build bytes and passed production evidence', async () => {
     const fixture = performanceFixture()
     const result = await fixture.admit()
-    assert.equal(result.artifactName, `e-mate-performance-admission-${SOURCE}`)
+    assert.equal(result.artifactName, performanceAdmissionArtifactName(SOURCE, 1))
     assert.equal(result.performanceRunId, fixture.evidence.performance_run_id)
     assert.equal(result.files.has(PERFORMANCE_VERIFIER_SOURCE), false)
     assert.deepEqual([...result.files.keys()].sort(), [
@@ -67,7 +71,36 @@ describe('external performance admission owner', () => {
     const cases = [
       ['unprotected main', fixture => { fixture.github.protection.enforceAdmins = false }],
       ['private repository', fixture => { fixture.github.repository.visibility = 'private' }],
+      ['rerun CI', fixture => { fixture.github.runs.get('100').runAttempt = 2 }],
+      ['rerun Desktop build', fixture => { fixture.github.runs.get('102').runAttempt = 2 }],
       ['failed TTFT job', fixture => { fixture.github.jobs.get('103')[0].conclusion = 'failure' }],
+      ['failed Profile publication job', fixture => { fixture.github.jobs.get('104')[0].conclusion = 'failure' }],
+      ['rerun Profile publication', fixture => { fixture.github.runs.get('104').runAttempt = 2 }],
+      ['Profile artifact from another run', fixture => {
+        fixture.github.artifacts.get('204').metadata.runId = '102'
+      }],
+      ['Profile workflow path drift', fixture => {
+        fixture.github.runs.get('104').path = '.github/workflows/desktop-release.yml'
+      }],
+      ['completed evidence run cannot impersonate the current run', fixture => {
+        Object.assign(fixture.github.runs.get('103'), { status: 'completed', conclusion: 'success' })
+      }],
+      ['evidence artifact from another run', fixture => {
+        fixture.github.artifacts.get('203').metadata.runId = '104'
+      }],
+      ['current performance source drift', fixture => {
+        fixture.github.runs.get('103').headSha = 'b'.repeat(40)
+      }],
+      ['old-attempt evidence artifact', fixture => {
+        fixture.config.currentRunAttempt = '2'
+        fixture.github.runs.get('103').runAttempt = 2
+        fixture.github.artifacts.get('203').metadata.name = `e-mate-performance-evidence-${SOURCE}-attempt-2`
+      }],
+      ['Profile aggregate digest drift', fixture => {
+        const aggregate = JSON.parse(fixture.github.file('203', PROFILE_COMPONENT_AGGREGATE_FILENAME).buffer)
+        aggregate.staged_profile_tree_sha256 = 'f'.repeat(64)
+        fixture.github.replaceFile('203', PROFILE_COMPONENT_AGGREGATE_FILENAME, pretty(aggregate))
+      }],
       ['extra evidence file', fixture => {
         fixture.github.artifacts.get('203').bundle.files.set('unreviewed.txt', testSource('extra'))
       }],
@@ -127,11 +160,14 @@ describe('external performance admission owner', () => {
 
   it('exposes a separate action with no caller path, R2 binding, or publication step', async () => {
     const action = await readFile(new URL('../performance/action.yml', import.meta.url), 'utf8')
+    const main = await readFile(new URL('../src/performance-main.mjs', import.meta.url), 'utf8')
     assert.match(action, /desktop-artifact-id:/u)
+    assert.match(action, /profile-release-run-id:/u)
+    assert.match(action, /profile-artifact-id:/u)
     assert.match(action, /evidence-artifact-id:/u)
     assert.match(action, /artifact-path:/u)
     assert.match(action, /performance-main\.mjs/u)
-    assert.doesNotMatch(action, /receipt-path|EMATE_R2_|publish/u)
+    assert.doesNotMatch(`${action}\n${main}`, /receipt-path|EMATE_R2_|R2Store|publishDesktopRelease/u)
   })
 })
 
@@ -152,8 +188,7 @@ function performanceFixture() {
       win32: artifactRecord('win32', win),
     },
   }
-  const aggregate = {
-    aggregate_sha256: '1'.repeat(64),
+  const aggregateUnsigned = {
     inventory_sha256: '2'.repeat(64),
     staged_profile_tree_sha256: '3'.repeat(64),
     targets: ['darwin-arm64', 'darwin-x64', 'win32-x64'].map((target, index) => ({
@@ -161,6 +196,10 @@ function performanceFixture() {
       profile_generation: String(index + 4).repeat(64),
       component_aggregate_sha256: String(index + 7).repeat(64),
     })),
+  }
+  const aggregate = {
+    aggregate_sha256: '5e7e8e251474acace51ce27b379b9b9b93a2cd50c6c489740bd8c0f450a81a58',
+    ...aggregateUnsigned,
   }
   const base = {
     schema_version: 1,
@@ -195,16 +234,18 @@ function performanceFixture() {
   const github = new FakeGithub({
     artifacts: [
       githubArtifact('202', `e-mate-desktop-release-${SOURCE}`, '102', {
-        'base-contract.json': pretty(base),
         'desktop-candidate.json': pretty(candidate),
-        'profile-component-aggregate.json': pretty(aggregate),
         'e-Mate-2.0.13-mac-universal.dmg': mac,
         'e-Mate-2.0.13-win-x64-Setup.exe': win,
       }),
-      githubArtifact('203', `e-mate-performance-evidence-${SOURCE}`, '103', {
+      githubArtifact('203', performanceEvidenceArtifactName(SOURCE, 1), '103', {
         [PERFORMANCE_EVIDENCE_FILENAME]: pretty(evidence),
         [PERFORMANCE_VERIFIER_SOURCE]: verifierBytes,
+        [PROFILE_COMPONENT_AGGREGATE_FILENAME]: pretty(aggregate),
         ...evidenceFiles,
+      }),
+      githubArtifact('204', `e-mate-profile-native-cloudflare-publication-${SOURCE}`, '104', {
+        'publication-plan.json': pretty({ status: 'prepared' }),
       }),
     ],
     sourceFiles: new Map([
@@ -222,7 +263,11 @@ function performanceFixture() {
     githubSha: SOURCE,
     sourceCommit: SOURCE,
     mainCiRunId: '100',
+    currentRunId: '103',
+    currentRunAttempt: '1',
     desktopArtifactId: '202',
+    profileReleaseRunId: '104',
+    profileReleaseArtifactId: '204',
     evidenceArtifactId: '203',
     signingKeyId: KEY_ID,
     privateKeyPem,
@@ -260,7 +305,12 @@ class FakeGithub {
     this.runs = new Map([
       ['100', run('100', '.github/workflows/ci.yml', 'push')],
       ['102', run('102', '.github/workflows/desktop-release.yml', 'workflow_dispatch')],
-      ['103', run('103', '.github/workflows/desktop-performance.yml', 'workflow_dispatch')],
+      ['103', {
+        ...run('103', '.github/workflows/desktop-performance.yml', 'workflow_dispatch'),
+        status: 'in_progress',
+        conclusion: null,
+      }],
+      ['104', run('104', '.github/workflows/profile-release.yml', 'workflow_dispatch')],
     ])
     this.jobs = new Map([
       ['100', [job('CI admission')]],
@@ -271,6 +321,7 @@ class FakeGithub {
         job('Bind native artifacts to the release manifest'),
       ]],
       ['103', [job('TTFT evidence')]],
+      ['104', [job('Prepare signed native Cloudflare publication bundle')]],
     ])
     this.artifacts = new Map(artifacts.map(value => [value.metadata.id, value]))
     this.sourceFiles = sourceFiles
@@ -284,6 +335,10 @@ class FakeGithub {
   async getArtifact(id) { return structuredClone(this.artifacts.get(String(id)).metadata) }
   async downloadArtifact(id) { return this.artifacts.get(String(id)).bundle }
   async getFile(path) { return Buffer.from(this.sourceFiles.get(path)) }
+  file(id, name) { return this.artifacts.get(String(id)).bundle.files.get(name) }
+  replaceFile(id, name, bytes) {
+    this.artifacts.get(String(id)).bundle.files.set(name, testSource(bytes))
+  }
 }
 
 function performanceEvidence(candidate, aggregate) {
@@ -370,8 +425,17 @@ function run(id, path, event) {
 
 function job(name) { return { name, status: 'completed', conclusion: 'success' } }
 
-function testSource(bytes) { return bufferSource(Buffer.from(bytes)) }
+function testSource(bytes) {
+  const buffer = Buffer.from(bytes)
+  return { ...bufferSource(buffer), buffer }
+}
 
 function pretty(value) { return Buffer.from(`${JSON.stringify(value, null, 2)}\n`) }
 
 function sha256(bytes) { return createHash('sha256').update(bytes).digest('hex') }
+
+assert.deepEqual(DESKTOP_RELEASE_ARTIFACT_FILES, [
+  'desktop-candidate.json',
+  'e-Mate-2.0.13-mac-universal.dmg',
+  'e-Mate-2.0.13-win-x64-Setup.exe',
+])
