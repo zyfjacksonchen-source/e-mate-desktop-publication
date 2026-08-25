@@ -38,6 +38,7 @@ Inputs:
 | `macos-artifact-id` | Exact single-file `e-mate-desktop-macos-<sha>` staging artifact from the admitted Desktop run |
 | `windows-artifact-id` | Exact single-file `e-mate-desktop-windows-<sha>` staging artifact from the manifest's Windows build run |
 | `expected-signed-current` | Literal `absent`, or exact `<bytes>:<sha256>` for the plugin to recheck before activation |
+| `expected-legacy-current` | Exact published 2.0.12 `desktop/latest.json` tombstone `<bytes>:<sha256>` for the final migration CAS |
 | `signing-key-id` | Existing key in the admitted Base `profile_signing_keys` and signed performance admission |
 
 The protected admission artifact must contain exactly:
@@ -96,12 +97,16 @@ the public key already present in the admitted Base.
 - status `ready-for-cloudflare-plugin` and authority `codex-cloudflare-plugin`;
 - exact repository, source, bucket, public origin, CI/admission/candidate/performance/staging artifact IDs;
 - signed-manifest identity, bytes, SHA-256, Base, schedule protocol, and key ID;
-- `desktop/latest.json` only as an `expected-unchanged` tombstone with mutation forbidden;
 - macOS installer, Windows installer, and manual signed manifest as immutable objects;
-- `desktop/signed/latest.json` as the only active pointer, with exact expected current, `no-store`, and `execution_order: last`.
+- `desktop/signed/latest.json` as the Base v7 active pointer, with exact expected current and `no-store`;
+- `desktop/latest.json` as the one monotonic 2.0.12 bootstrap pointer, CAS-bound to the exact published tombstone and changed last to the same signed manifest bytes.
 
-The manual immutable manifest and active pointer reference the same
-`desktop-release-signed.json` bytes and SHA-256.
+The manual immutable manifest and both active pointers reference the same
+`desktop-release-signed.json` bytes and SHA-256. The signed bytes are also
+bounded by the 2.0.12 reader's 16 KiB limit. Old clients ignore fields they do
+not understand but still require the fixed R2 origin, immutable release path,
+byte count, SHA-256, installer format, codesign, native updater transaction and
+rollback; after this transition Base v7 reads only the signed pointer.
 
 `cloudflare-plugin-handoff.json` binds the manifest and plan hashes to the exact
 action commit and GitHub provenance. It explicitly records that no production
@@ -110,8 +115,9 @@ write, public readback, or pointer change occurred.
 The caller should upload this directory unchanged as
 `e-mate-desktop-cloudflare-handoff-<sha>`. The connected Codex Cloudflare plugin
 is the sole production writer. It must independently check the plan, expected
-tombstone, expected active pointer, immutable-object collisions, uploaded bytes,
-metadata, and public readback before changing the active pointer last.
+tombstone, both expected active pointers, immutable-object collisions, uploaded
+bytes, metadata, and public readback before changing the signed pointer and then
+the legacy bootstrap pointer last.
 
 ## Protected performance admission action
 

@@ -42,6 +42,7 @@ const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u
 const BASE_RUNTIME_PACKAGE = /^(?:@deepseek-ai\/[a-z0-9][a-z0-9._-]*|@e-mate\/desktop\/vision-toolkit|react(?:-dom)?)$/u
 const TARGETS = ['darwin-arm64', 'darwin-x64', 'win32-x64']
 const MAX_JSON_BYTES = 64 * 1024
+const LEGACY_MANIFEST_MAX_BYTES = 16 * 1024
 const IMMUTABLE_CACHE = 'public,max-age=31536000,immutable'
 const JSON_CONTENT_TYPE = 'application/json'
 const BINARY_CONTENT_TYPE = 'application/octet-stream'
@@ -407,6 +408,9 @@ export async function prepareDesktopPublication(config, dependencies) {
     },
   }
   const signedBytes = Buffer.from(`${JSON.stringify(signedManifest, null, 2)}\n`)
+  if (signedBytes.byteLength > LEGACY_MANIFEST_MAX_BYTES) {
+    throw new Error('signed Desktop manifest exceeds the 2.0.12 bootstrap reader limit')
+  }
   const signedIdentity = sha256(Buffer.from(canonicalJson(signedManifest), 'utf8'))
   const signedRawSha256 = sha256(signedBytes)
 
@@ -438,10 +442,21 @@ export async function prepareDesktopPublication(config, dependencies) {
     },
   ]
   const activePointer = {
-    execution_order: 'last',
+    execution_order: 'before-legacy-bootstrap',
     key: 'desktop/signed/latest.json',
     url: `${PUBLIC_ORIGIN}/desktop/signed/latest.json`,
     expected_current: formatExpectedCurrent(config.expectedSignedCurrent),
+    artifact_path: SIGNED_MANIFEST_FILENAME,
+    bytes: signedBytes.byteLength,
+    sha256: signedRawSha256,
+    content_type: JSON_CONTENT_TYPE,
+    cache_control: 'no-store',
+  }
+  const legacyBootstrapPointer = {
+    execution_order: 'last',
+    key: LEGACY_TOMBSTONE.key,
+    url: `${PUBLIC_ORIGIN}/${LEGACY_TOMBSTONE.key}`,
+    expected_current: formatExpectedCurrent(config.expectedLegacyCurrent),
     artifact_path: SIGNED_MANIFEST_FILENAME,
     bytes: signedBytes.byteLength,
     sha256: signedRawSha256,
@@ -476,17 +491,9 @@ export async function prepareDesktopPublication(config, dependencies) {
       sha256: signedRawSha256,
       signature_key_id: config.signingKeyId,
     },
-    legacy_tombstone: {
-      status: 'expected-unchanged',
-      mutation: 'forbidden',
-      key: LEGACY_TOMBSTONE.key,
-      url: `${PUBLIC_ORIGIN}/${LEGACY_TOMBSTONE.key}`,
-      bytes: LEGACY_TOMBSTONE.bytes,
-      sha256: LEGACY_TOMBSTONE.sha256,
-      content_type: JSON_CONTENT_TYPE,
-    },
     immutable_objects: immutableObjects,
     active_pointer: activePointer,
+    legacy_bootstrap_pointer: legacyBootstrapPointer,
   }
   const publicationPlanBytes = Buffer.from(`${JSON.stringify(publicationPlan, null, 2)}\n`)
   const handoff = {
@@ -517,6 +524,7 @@ export async function prepareDesktopPublication(config, dependencies) {
       r2_write_performed: false,
       public_readback_performed: false,
       active_pointer_changed: false,
+      legacy_pointer_changed: false,
     },
   }
   const handoffBytes = Buffer.from(`${JSON.stringify(handoff, null, 2)}\n`)
@@ -555,6 +563,10 @@ function validateInvocation(config) {
   if (config.expectedSignedCurrent !== null && (!Number.isSafeInteger(config.expectedSignedCurrent.bytes)
     || config.expectedSignedCurrent.bytes <= 0 || !SHA256.test(config.expectedSignedCurrent.sha256))) {
     throw new Error('expected signed pointer identity is invalid')
+  }
+  if (config.expectedLegacyCurrent?.bytes !== LEGACY_TOMBSTONE.bytes
+    || config.expectedLegacyCurrent.sha256 !== LEGACY_TOMBSTONE.sha256) {
+    throw new Error('expected legacy pointer is not the exact 2.0.12 tombstone')
   }
 }
 

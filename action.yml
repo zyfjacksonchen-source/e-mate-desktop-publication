@@ -19,6 +19,9 @@ inputs:
   expected-signed-current:
     description: Literal absent, or the exact current desktop/signed/latest.json identity as <bytes>:<sha256>, for the Cloudflare plugin to recheck before activation.
     required: true
+  expected-legacy-current:
+    description: Exact current desktop/latest.json 2.0.12 tombstone identity as <bytes>:<sha256>, for the final monotonic Base v7 bootstrap CAS.
+    required: true
   signing-key-id:
     description: Existing Base profile_signing_keys identity used for the domain-separated Desktop signature.
     required: true
@@ -65,6 +68,7 @@ runs:
         EMATE_MACOS_STAGING_ARTIFACT_ID: ${{ inputs.macos-artifact-id }}
         EMATE_WINDOWS_STAGING_ARTIFACT_ID: ${{ inputs.windows-artifact-id }}
         EMATE_EXPECTED_SIGNED_CURRENT: ${{ inputs.expected-signed-current }}
+        EMATE_EXPECTED_LEGACY_CURRENT: ${{ inputs.expected-legacy-current }}
         EMATE_SIGNING_KEY_ID: ${{ inputs.signing-key-id }}
       run: |
         set -euo pipefail
