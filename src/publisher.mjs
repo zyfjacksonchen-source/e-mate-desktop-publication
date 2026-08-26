@@ -35,6 +35,12 @@ export const LEGACY_TOMBSTONE = Object.freeze({
   bytes: 948,
   sha256: 'e6d5e045364bdac97ea7fef41b1e28a20af06c9f4ffdd85d2c136e982d12a7dc',
 })
+export const EMERGENCY_LEGACY_PREDECESSOR = Object.freeze({
+  key: LEGACY_TOMBSTONE.key,
+  bytes: 948,
+  sha256: '1d70004c726e458525205dd370ebea595b3121ffd2afe49d7c65d646c4ac19c4',
+})
+const LEGACY_PREDECESSORS = [LEGACY_TOMBSTONE, EMERGENCY_LEGACY_PREDECESSOR]
 
 const SHA256 = /^[0-9a-f]{64}$/u
 const SHA40 = /^[0-9a-f]{40}$/u
@@ -661,9 +667,9 @@ function validateInvocation(config) {
     || config.expectedSignedCurrent.bytes <= 0 || !SHA256.test(config.expectedSignedCurrent.sha256))) {
     throw new Error('expected signed pointer identity is invalid')
   }
-  if (config.expectedLegacyCurrent?.bytes !== LEGACY_TOMBSTONE.bytes
-    || config.expectedLegacyCurrent.sha256 !== LEGACY_TOMBSTONE.sha256) {
-    throw new Error('expected legacy pointer is not the exact 2.0.12 tombstone')
+  if (!LEGACY_PREDECESSORS.some(predecessor => config.expectedLegacyCurrent?.bytes === predecessor.bytes
+    && config.expectedLegacyCurrent.sha256 === predecessor.sha256)) {
+    throw new Error('expected legacy pointer is not an exact approved predecessor')
   }
 }
 

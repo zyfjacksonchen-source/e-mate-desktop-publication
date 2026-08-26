@@ -20,7 +20,7 @@ inputs:
     description: Literal absent, or the exact current desktop/signed/latest.json identity as <bytes>:<sha256>, for the Cloudflare plugin to recheck before activation.
     required: true
   expected-legacy-current:
-    description: Exact current desktop/latest.json 2.0.12 tombstone identity as <bytes>:<sha256>, for the final monotonic Base v7 bootstrap CAS.
+    description: Exact approved desktop/latest.json predecessor identity as <bytes>:<sha256>, for the final monotonic Base v7 bootstrap CAS.
     required: true
   signing-key-id:
     description: Existing Base profile_signing_keys identity used for the domain-separated Desktop signature.

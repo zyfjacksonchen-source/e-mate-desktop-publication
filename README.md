@@ -38,7 +38,7 @@ Inputs:
 | `macos-artifact-id` | Exact closed `e-mate-desktop-macos-<sha>` staging artifact from the admitted CI run |
 | `windows-artifact-id` | Exact closed `e-mate-desktop-windows-<sha>` staging artifact from the admitted CI run |
 | `expected-signed-current` | Literal `absent`, or exact `<bytes>:<sha256>` for the plugin to recheck before activation |
-| `expected-legacy-current` | Exact published 2.0.12 `desktop/latest.json` tombstone `<bytes>:<sha256>` for the final migration CAS |
+| `expected-legacy-current` | Exact approved `desktop/latest.json` predecessor `<bytes>:<sha256>` for the final migration CAS; only the frozen 2.0.12 tombstone and the immutable emergency 2.0.13 receipt are accepted |
 | `signing-key-id` | Existing key in the admitted Base `profile_signing_keys` and signed performance admission |
 
 The protected admission artifact must contain exactly:
@@ -103,7 +103,7 @@ the public key already present in the admitted Base.
 - signed-manifest identity, bytes, SHA-256, Base, schedule protocol, and key ID;
 - macOS installer, Windows installer, and manual signed manifest as immutable objects;
 - `desktop/signed/latest.json` as the Base v7 active pointer, with exact expected current and `no-store`;
-- `desktop/latest.json` as the one monotonic 2.0.12 bootstrap pointer, CAS-bound to the exact published tombstone and changed last to the same signed manifest bytes.
+- `desktop/latest.json` as the one monotonic bootstrap pointer, CAS-bound to either the frozen 2.0.12 tombstone or the exact immutable emergency 2.0.13 predecessor and changed last to the same signed manifest bytes.
 
 The manual immutable manifest and both active pointers reference the same
 `desktop-release-signed.json` bytes and SHA-256. The signed bytes are also
