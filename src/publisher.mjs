@@ -423,7 +423,7 @@ export async function prepareDesktopPublication(config, dependencies) {
     const stagingBundle = await github.downloadArtifact(stagingArtifactId)
     assertDownloadedArtifact(stagingBundle, stagingArtifact)
     assertNoMacSmoke(stagingBundle.files)
-    await validateDesktopCiStagingArtifact(stagingBundle, {
+    const archiveEntries = await validateDesktopCiStagingArtifact(stagingBundle, {
       platform,
       installerName: artifactNames[platform],
       expected,
@@ -437,6 +437,7 @@ export async function prepareDesktopPublication(config, dependencies) {
       digest: stagingArtifact.digest,
       runId: String(stagingArtifact.runId),
       runAttempt: 1,
+      archiveEntries,
     }
   }
 
@@ -519,6 +520,7 @@ export async function prepareDesktopPublication(config, dependencies) {
       github_run_id: stagingArtifacts[platform].runId,
       github_run_attempt: stagingArtifacts[platform].runAttempt,
       github_artifact_name: stagingArtifacts[platform].name,
+      github_archive_entries: stagingArtifacts[platform].archiveEntries,
       artifact_path: artifactNames[platform],
       bytes: unsigned.artifacts[platform].bytes,
       sha256: unsigned.artifacts[platform].sha256,
@@ -830,6 +832,7 @@ async function validateDesktopCiStagingArtifact(bundle, context) {
     || runtime.installer.sha256 !== context.expected.sha256 || runtime.installer.format !== format) {
     throw new Error(`GitHub ${context.platform} Desktop runtime verification receipt is invalid`)
   }
+  return actual.map(name => ({ name, bytes: requiredFile(bundle.files, name).bytes }))
 }
 
 function validateUnsignedManifest(value, sourceCommit) {

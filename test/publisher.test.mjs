@@ -85,6 +85,16 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     ])
     assert.deepEqual([mac.artifact_path, win.artifact_path], DESKTOP_RELEASE_ARTIFACT_FILES.slice(1))
     assert.ok([mac, win].every(item => /^sha256:[0-9a-f]{64}$/u.test(item.github_artifact_digest)))
+    assert.deepEqual(mac.github_archive_entries.map(item => item.name), [
+      'desktop-artifact-receipt.json',
+      'desktop-runtime-verification.json',
+      'e-Mate-2.0.13-mac-universal.dmg',
+    ])
+    assert.deepEqual(win.github_archive_entries.map(item => item.name), [
+      'desktop-artifact-receipt.json',
+      'desktop-runtime-verification.json',
+      'e-Mate-2.0.13-win-x64-Setup.exe',
+    ])
     assert.equal(manual.artifact_path, SIGNED_MANIFEST_FILENAME)
     for (const field of ['bytes', 'sha256', 'content_type']) {
       assert.equal(manual[field], plan.active_pointer[field])
@@ -131,6 +141,12 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     const plan = JSON.parse(await result.files.get(PUBLICATION_PLAN_FILENAME).read())
     assert.equal(plan.immutable_objects[0].artifact_path, 'e-Mate-2.0.13-mac-universal.dmg')
     assert.equal(plan.immutable_objects.some(item => item.artifact_path.endsWith('.blockmap')), false)
+    assert.deepEqual(plan.immutable_objects[0].github_archive_entries.map(item => item.name), [
+      'desktop-artifact-receipt.json',
+      'desktop-runtime-verification.json',
+      'e-Mate-2.0.13-mac-universal.dmg',
+      'e-Mate-2.0.13-mac-universal.dmg.blockmap',
+    ])
   })
 
   it('fails closed on authority, provenance, closed-schema, staging, or trust drift', async t => {

@@ -35,8 +35,8 @@ Inputs:
 | `source-sha` | Current protected `main`, shared by every admitted run and artifact |
 | `main-ci-run-id` | Successful attempt-1 `.github/workflows/ci.yml` push run with `CI admission` |
 | `admission-artifact-id` | Exact attempt-1 `e-mate-desktop-admission-<sha>` artifact |
-| `macos-artifact-id` | Exact single-file `e-mate-desktop-macos-<sha>` staging artifact from the admitted Desktop run |
-| `windows-artifact-id` | Exact single-file `e-mate-desktop-windows-<sha>` staging artifact from the manifest's Windows build run |
+| `macos-artifact-id` | Exact closed `e-mate-desktop-macos-<sha>` staging artifact from the admitted CI run |
+| `windows-artifact-id` | Exact closed `e-mate-desktop-windows-<sha>` staging artifact from the admitted CI run |
 | `expected-signed-current` | Literal `absent`, or exact `<bytes>:<sha256>` for the plugin to recheck before activation |
 | `expected-legacy-current` | Exact published 2.0.12 `desktop/latest.json` tombstone `<bytes>:<sha256>` for the final migration CAS |
 | `signing-key-id` | Existing key in the admitted Base `profile_signing_keys` and signed performance admission |
@@ -54,10 +54,11 @@ digest, run, attempt, workflow, branch, source commit, required jobs, exact file
 set, installer byte count, and installer SHA-256. `mac-smoke`, extra files,
 path traversal, old attempts, or a different protected-main source fail closed.
 
-The macOS and Windows staging artifacts each contain exactly one installer as a
-ZIP `Stored` entry (upload compression level 0). They are independently
-downloaded and compared with the same installer in the final three-file
-candidate. The plan binds each staging source with:
+The macOS and Windows staging artifacts each contain the installer, runtime
+verification receipt, artifact receipt, and optional blockmap as ZIP `Stored`
+entries (upload compression level 0). They are independently downloaded and
+compared with the same installer in the final three-file candidate. The plan
+binds each staging source with:
 
 ```text
 github_artifact_id
@@ -65,6 +66,7 @@ github_artifact_digest
 github_run_id
 github_run_attempt = 1
 github_artifact_name
+github_archive_entries = exact ordered names and byte counts
 artifact_path
 bytes
 sha256
@@ -72,10 +74,12 @@ content_type
 cache_control
 ```
 
-This single-file, compression-level-0 staging shape lets the connected
-Cloudflare plugin use an action-time range-stream Worker for installers larger
-than the direct object API limit. This repository does not deploy that Worker,
-obtain a GitHub download redirect, or upload any bytes.
+This closed, compression-level-0 staging shape lets the connected
+Cloudflare plugin use the reviewed short-lived range-stream Worker under
+`worker/` for installers larger than the direct object API limit. Neither
+composite action deploys that Worker, obtains a GitHub download redirect, or
+uploads any bytes; deployment and invocation remain an explicit connected
+Cloudflare plugin operation.
 
 ### Three-file output
 

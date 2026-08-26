@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "document_type": "emate.cloudflare-plugin-large-object-bridge-deployment",
+  "publication_authority": "codex-cloudflare-plugin",
+  "script": "worker/index.mjs",
+  "compatibility_date": "2026-08-25",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "r2_binding": {
+    "name": "RELEASES",
+    "bucket_name": "emate-desktop-downloads"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/v1/ingest",
+    "content_type": "application/json",
+    "max_bytes": 8192
+  },
+  "limits": {
+    "authorization_window_ms": 900000,
+    "transfer_timeout_ms": 600000,
+    "object_max_bytes": 536870912
+  },
+  "lifecycle": {
+    "one_artifact_per_deployment": true,
+    "one_time_random_bearer_secret": "AUTH_TOKEN",
+    "temp_cleanup_only": true,
+    "delete_worker_after_call": true
+  },
+  "forbidden_operations": [
+    "bucket-list",
+    "arbitrary-object-delete",
+    "pointer-write",
+    "final-overwrite",
+    "credential-log"
+  ]
+}
