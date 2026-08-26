@@ -9,9 +9,6 @@ import {
   EXPECTED_ACTION_REPOSITORY,
   EXPECTED_REPOSITORY,
   LEGACY_TOMBSTONE,
-  PERFORMANCE_EVIDENCE_FILENAME,
-  PERFORMANCE_MODEL_LEAF_IDS,
-  PERFORMANCE_MODEL_ROSTER,
   PUBLICATION_PLAN_FILENAME,
   PUBLIC_ORIGIN,
   RELEASE_SIGNATURE_CONTEXT,
@@ -19,10 +16,7 @@ import {
   bufferSource,
   canonicalJson,
   parseExpectedCurrent,
-  performanceAdmissionArtifactName,
   prepareDesktopPublication,
-  signPerformanceAggregateAdmission,
-  signPerformanceAdmission,
 } from '../src/publisher.mjs'
 import { parseStoredArchiveEntries, validateArchiveEntries } from '../src/main.mjs'
 
@@ -54,6 +48,7 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
 
     const planBytes = await result.files.get(PUBLICATION_PLAN_FILENAME).read()
     const plan = JSON.parse(planBytes)
+    assert.equal(plan.schema_version, 2)
     assert.deepEqual(Object.keys(plan), [
       'schema_version', 'document_type', 'status', 'publication_authority', 'repository',
       'source_commit', 'bucket', 'public_origin', 'github', 'signed_manifest',
@@ -104,6 +99,7 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     assert.equal(manual.sha256, sha256(signedBytes))
 
     const handoff = JSON.parse(await result.files.get(CLOUDFLARE_HANDOFF_FILENAME).read())
+    assert.equal(handoff.schema_version, 2)
     assert.deepEqual(Object.keys(handoff), [
       'schema_version', 'document_type', 'status', 'publication_authority', 'repository',
       'source_commit', 'action', 'github', 'files', 'production_state',
@@ -165,7 +161,6 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
       ['rerun CI', fixture => { fixture.github.runs.get('100').runAttempt = 2 }],
       ['rerun admission', fixture => { fixture.github.runs.get('101').runAttempt = 2 }],
       ['rerun Desktop build', fixture => { fixture.github.runs.get('102').runAttempt = 2 }],
-      ['rerun performance', fixture => { fixture.github.runs.get('103').runAttempt = 2 }],
       ['extra admission file', fixture => {
         fixture.github.artifacts.get('201').bundle.files.set('extra.json', testSource('{}'))
       }],
@@ -218,30 +213,6 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
         const manifest = JSON.parse(fixture.github.file('201', 'desktop-release-unsigned.json').buffer)
         manifest.channel = 'stable'
         fixture.github.replaceFile('201', 'desktop-release-unsigned.json', pretty(manifest))
-      }],
-      ['missing aggregate child', fixture => {
-        fixture.github.artifacts.get('203').bundle.files.delete(
-          `${childPrefix(3, PERFORMANCE_MODEL_ROSTER[3])}/${PERFORMANCE_EVIDENCE_FILENAME}`,
-        )
-      }],
-      ['extra aggregate child', fixture => {
-        fixture.github.artifacts.get('203').bundle.files.set('children/05-extra/performance-admission.json', testSource('{}'))
-      }],
-      ['misordered aggregate children', fixture => {
-        const admission = JSON.parse(fixture.github.file('203', 'performance-admission.json').buffer)
-        admission.children.reverse()
-        fixture.github.replaceFile('203', 'performance-admission.json', pretty(admission))
-      }],
-      ['duplicate aggregate child', fixture => {
-        const admission = JSON.parse(fixture.github.file('203', 'performance-admission.json').buffer)
-        admission.children[3] = structuredClone(admission.children[0])
-        fixture.github.replaceFile('203', 'performance-admission.json', pretty(admission))
-      }],
-      ['failed aggregate child', fixture => {
-        const path = `${childPrefix(1, PERFORMANCE_MODEL_ROSTER[1])}/${PERFORMANCE_EVIDENCE_FILENAME}`
-        const evidence = JSON.parse(fixture.github.file('203', path).buffer)
-        evidence.decision.gate_status = 'failed'
-        fixture.github.replaceFile('203', path, pretty(evidence))
       }],
     ]
     for (const [name, mutate] of cases) {
@@ -310,81 +281,7 @@ function releaseFixture() {
     darwin: manifestArtifact('darwin', mac, '100'),
     win32: manifestArtifact('win32', win, '100'),
   }
-  const leafFiles = {}
-  const children = PERFORMANCE_MODEL_ROSTER.map((model, index) => {
-    const evidence = publicationEvidence(`performance-run-${model.route_id}`, SOURCE, artifacts, model)
-    const evidenceBytes = pretty(evidence)
-    const verifier = {
-      contract: 'ttft-v2',
-      source: 'scripts/performance-parity.mjs',
-      source_commit: SOURCE,
-      source_sha256: '6'.repeat(64),
-      harness_commit: SOURCE,
-      evidence_filename: PERFORMANCE_EVIDENCE_FILENAME,
-      decision_sha256: sha256(pretty(evidence.decision)),
-      gate_status: 'passed',
-    }
-    const admission = signPerformanceAdmission({
-      schema_version: 1,
-      document_type: 'emate.performance-admission',
-      status: 'passed',
-      performance_run_id: evidence.performance_run_id,
-      source_commit: SOURCE,
-      base_contract_id: BASE_ID,
-      profile_component_aggregate_sha256: aggregate.aggregate_sha256,
-      desktop_artifacts: {
-        darwin: { bytes: artifacts.darwin.bytes, sha256: artifacts.darwin.sha256 },
-        win32: { bytes: artifacts.win32.bytes, sha256: artifacts.win32.sha256 },
-      },
-      evidence_sha256: sha256(evidenceBytes),
-      verifier,
-    }, privateKeyPem, KEY_ID)
-    const admissionBytes = pretty(admission)
-    const prefix = childPrefix(index, model)
-    Object.assign(leafFiles, {
-      [`${prefix}/performance-admission.json`]: admissionBytes,
-      [`${prefix}/${PERFORMANCE_EVIDENCE_FILENAME}`]: evidenceBytes,
-      ...Object.fromEntries(publicationEvidencePaths(evidence).map(path => [`${prefix}/${path}`, Buffer.from('{}')])),
-    })
-    return {
-      route_id: model.route_id,
-      performance_run_id: evidence.performance_run_id,
-      admission_sha256: sha256(admissionBytes),
-      evidence_sha256: sha256(evidenceBytes),
-      verifier,
-    }
-  })
-  const aggregateVerifier = {
-    contract: 'ttft-v2-aggregate',
-    source: 'scripts/performance-parity.mjs',
-    source_commit: SOURCE,
-    source_sha256: '6'.repeat(64),
-    harness_commit: SOURCE,
-    evidence_filename: 'performance-admission.json',
-    decision_sha256: sha256(Buffer.from(canonicalJson(children.map(child => child.verifier.decision_sha256)))),
-    gate_status: 'passed',
-  }
-  const aggregateRunId = `performance-aggregate-${sha256(Buffer.from(canonicalJson(children))).slice(0, 40)}`
-  const performanceAdmission = signPerformanceAggregateAdmission({
-    schema_version: 1,
-    document_type: 'emate.performance-aggregate-admission',
-    status: 'passed',
-    performance_run_id: aggregateRunId,
-    source_commit: SOURCE,
-    base_contract_id: BASE_ID,
-    profile_component_aggregate_sha256: aggregate.aggregate_sha256,
-    desktop_artifacts: {
-      darwin: { bytes: artifacts.darwin.bytes, sha256: artifacts.darwin.sha256 },
-      win32: { bytes: artifacts.win32.bytes, sha256: artifacts.win32.sha256 },
-    },
-    roster: PERFORMANCE_MODEL_ROSTER,
-    children,
-    evidence_sha256: sha256(Buffer.from(canonicalJson(children.map(child => child.evidence_sha256)))),
-    verifier: aggregateVerifier,
-  }, privateKeyPem, KEY_ID)
-  const performanceBytes = pretty(performanceAdmission)
   const candidateBundleSha = '7'.repeat(64)
-  const performanceBundleSha = '8'.repeat(64)
   const provenance = {
     schema_version: 1,
     document_type: 'emate.github-artifact-provenance',
@@ -398,18 +295,10 @@ function releaseFixture() {
         run_id: '102',
         run_attempt: 1,
       },
-      {
-        role: 'performance_admission',
-        name: performanceAdmissionArtifactName(SOURCE, 1),
-        artifact_id: '203',
-        digest: `sha256:${performanceBundleSha}`,
-        run_id: '103',
-        run_attempt: 1,
-      },
     ],
   }
   const manifest = {
-    schema_version: 1,
+    schema_version: 2,
     document_type: 'emate.desktop-release-manifest',
     release_status: 'admitted',
     version: '2.0.13',
@@ -417,19 +306,13 @@ function releaseFixture() {
     base_contract_id: BASE_ID,
     schedule_protocol_floor: 1,
     profile_component_aggregate: aggregate,
-    performance: {
-      performance_run_id: aggregateRunId,
-      admission_sha256: sha256(performanceBytes),
-      signature_key_id: KEY_ID,
-      verifier: aggregateVerifier,
-    },
     github_artifact_provenance: provenance,
     artifacts,
   }
   const candidate = {
-    schema_version: 1,
+    schema_version: 2,
     document_type: 'emate.desktop-artifact-candidate',
-    release_status: 'performance-pending',
+    release_status: 'admission-pending',
     version: '2.0.13',
     source_commit: SOURCE,
     schedule_protocol_floor: 1,
@@ -472,10 +355,6 @@ function releaseFixture() {
         'e-Mate-2.0.13-mac-universal.dmg': mac,
         'e-Mate-2.0.13-win-x64-Setup.exe': win,
       }),
-      artifact('203', performanceAdmissionArtifactName(SOURCE, 1), '103', performanceBundleSha, {
-        'performance-admission.json': performanceBytes,
-        ...leafFiles,
-      }),
       artifact('206', `e-mate-desktop-macos-${SOURCE}`, '100', 'a'.repeat(64), stagingFiles('darwin', mac)),
       artifact('207', `e-mate-desktop-windows-${SOURCE}`, '100', 'b'.repeat(64), stagingFiles('win32', win)),
     ],
@@ -506,69 +385,6 @@ function releaseFixture() {
   }
 }
 
-function publicationEvidence(performanceRunId, harnessCommit, artifacts, model) {
-  const path = (name, candidate) => {
-    const runReceipt = Object.fromEntries([
-      ['raw_samples_artifact', 'raw-samples'],
-      ['native_trace_artifact', 'native-session-trace'],
-      ['provider_receipt_artifact', 'provider-invocation-receipt'],
-      ['request_header_artifact', 'request-headers'],
-      ['renderer_paint_artifact', 'renderer-paint-trace'],
-      ['installed_runtime_artifact', 'installed-runtime-receipt'],
-      ...(candidate ? [['enterprise_receipt_artifact', 'enterprise-runtime-receipt']] : []),
-    ].map(([field, kind]) => [field, {
-      kind,
-      path: `evidence/${name}/${field}.json`,
-      sha256: sha256(Buffer.from('{}')),
-    }]))
-    if (model !== undefined) {
-      runReceipt.provider = model.provider
-      runReceipt.model = model.model
-    }
-    if (candidate) {
-      runReceipt.runtime = {
-        source_commit: SOURCE,
-        base_contract_id: BASE_ID,
-        profile_generation: '4'.repeat(64),
-        composition_sha256: '5'.repeat(64),
-        desktop_artifact_sha256: artifacts.darwin.sha256,
-        desktop_artifact_bytes: artifacts.darwin.bytes,
-      }
-      runReceipt.install_receipt = {
-        target: 'darwin-arm64',
-        package_sha256: artifacts.darwin.sha256,
-        package_bytes: artifacts.darwin.bytes,
-      }
-    }
-    return { run_receipt: runReceipt }
-  }
-  return {
-    schema_version: 2,
-    comparison_kind: 'installed-2.0.12-vs-2.0.13',
-    performance_run_id: performanceRunId,
-    evidence_kind: 'production-real-provider',
-    harness_commit: harnessCommit,
-    ...(model === undefined ? {} : { performance_model: model }),
-    paths: {
-      baseline: path('baseline', false),
-      emate_online: path('emate_online', true),
-      emate_enterprise_unavailable_valid_cache: path('emate_enterprise_unavailable_valid_cache', true),
-    },
-    production_artifacts_verified: true,
-    decision: { gate_status: 'passed', failures: [], production_receipt_failures: [], comparisons: {} },
-  }
-}
-
-function publicationEvidencePaths(evidence) {
-  return Object.values(evidence.paths).flatMap(path => Object.entries(path.run_receipt)
-    .filter(([name]) => name.endsWith('_artifact'))
-    .map(([, value]) => value.path))
-}
-
-function childPrefix(index) {
-  return `children/${String(index + 1).padStart(2, '0')}-${PERFORMANCE_MODEL_LEAF_IDS[index]}`
-}
-
 class FakeGithub {
   constructor({ source, artifacts }) {
     this.source = source
@@ -590,7 +406,6 @@ class FakeGithub {
       ['100', run('100', '.github/workflows/ci.yml', 'push')],
       ['101', run('101', '.github/workflows/desktop-admission.yml', 'workflow_dispatch')],
       ['102', run('102', '.github/workflows/desktop-release.yml', 'workflow_dispatch')],
-      ['103', run('103', '.github/workflows/desktop-performance.yml', 'workflow_dispatch')],
     ])
     this.jobs = new Map([
       ['100', [
@@ -600,7 +415,6 @@ class FakeGithub {
       ]],
       ['101', [job('Desktop release admission')]],
       ['102', [job('Bind exact protected-main CI artifacts to the release manifest')]],
-      ['103', [job('Performance admission')]],
     ])
     this.artifacts = new Map(artifacts.map(item => [item.metadata.id, item]))
   }

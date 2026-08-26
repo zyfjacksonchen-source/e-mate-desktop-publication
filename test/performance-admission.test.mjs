@@ -231,9 +231,9 @@ function performanceFixture() {
   const mac = Buffer.from('exact-mac-installer')
   const win = Buffer.from('exact-windows-installer')
   const candidate = {
-    schema_version: 1,
+    schema_version: 2,
     document_type: 'emate.desktop-artifact-candidate',
-    release_status: 'performance-pending',
+    release_status: 'admission-pending',
     version: '2.0.13',
     source_commit: SOURCE,
     schedule_protocol_floor: 1,

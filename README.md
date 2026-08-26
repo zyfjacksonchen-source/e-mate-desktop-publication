@@ -2,8 +2,8 @@
 
 This repository has two exact-commit composite actions:
 
-- `/performance` verifies four real installed TTFT v2 evidence leaves and signs one performance aggregate admission.
-- `/` verifies the final protected-main admission, signs the Desktop manifest, and emits a byte-bound publication plan for the connected Codex Cloudflare plugin.
+- `/` verifies the final protected-main release admission, signs the Desktop manifest, and emits a byte-bound publication plan for the connected Codex Cloudflare plugin.
+- `/performance` remains an optional diagnostic action for four installed TTFT v2 evidence leaves. Its output is not a release prerequisite and is not consumed by `/`.
 
 Neither action can read or write production Cloudflare R2 state. The root action
 never claims that an object is online or that a pointer changed. Its successful
@@ -39,7 +39,7 @@ Inputs:
 | `windows-artifact-id` | Exact closed `e-mate-desktop-windows-<sha>` staging artifact from the admitted CI run |
 | `expected-signed-current` | Literal `absent`, or exact `<bytes>:<sha256>` for the plugin to recheck before activation |
 | `expected-legacy-current` | Exact approved `desktop/latest.json` predecessor `<bytes>:<sha256>` for the final migration CAS; only the frozen 2.0.12 tombstone and the immutable emergency 2.0.13 receipt are accepted |
-| `signing-key-id` | Existing key in the admitted Base `profile_signing_keys` and signed performance admission |
+| `signing-key-id` | Existing key in the admitted Base `profile_signing_keys` |
 
 The protected admission artifact must contain exactly:
 
@@ -48,8 +48,7 @@ base-contract.json
 desktop-release-unsigned.json
 ```
 
-The unsigned manifest binds the final three-file Desktop artifact and the signed
-performance artifact. The action verifies their GitHub API ID, name, archive
+The unsigned manifest binds the final three-file Desktop artifact. The action verifies its GitHub API ID, name, archive
 digest, run, attempt, workflow, branch, source commit, required jobs, exact file
 set, installer byte count, and installer SHA-256. `mac-smoke`, extra files,
 path traversal, old attempts, or a different protected-main source fail closed.
@@ -91,15 +90,15 @@ cloudflare-publication-plan.json
 cloudflare-plugin-handoff.json
 ```
 
-`desktop-release-signed.json` is the admitted 11-field manifest plus one
+`desktop-release-signed.json` is the admitted 10-field schema-v2 manifest plus one
 domain-separated Ed25519 signature. Its signing context is
-`e-mate-desktop-release-manifest-v1\0`, and the private key must derive exactly
+`e-mate-desktop-release-manifest-v2\0`, and the private key must derive exactly
 the public key already present in the admitted Base.
 
 `cloudflare-publication-plan.json` has a closed schema. It records:
 
 - status `ready-for-cloudflare-plugin` and authority `codex-cloudflare-plugin`;
-- exact repository, source, bucket, public origin, CI/admission/candidate/performance/staging artifact IDs;
+- exact repository, source, bucket, public origin, CI/admission/candidate/staging artifact IDs;
 - signed-manifest identity, bytes, SHA-256, Base, schedule protocol, and key ID;
 - macOS installer, Windows installer, and manual signed manifest as immutable objects;
 - `desktop/signed/latest.json` as the Base v7 active pointer, with exact expected current and `no-store`;
