@@ -5,6 +5,7 @@ import { describe, it } from 'node:test'
 import {
   CLOUDFLARE_HANDOFF_FILENAME,
   DESKTOP_RELEASE_ARTIFACT_FILES,
+  EMERGENCY_LEGACY_PREDECESSOR,
   EXPECTED_ACTION_REPOSITORY,
   EXPECTED_REPOSITORY,
   LEGACY_TOMBSTONE,
@@ -130,8 +131,14 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     assert.deepEqual(parseExpectedCurrent(`123:${'f'.repeat(64)}`), fixture.config.expectedSignedCurrent)
     assert.throws(() => parseExpectedCurrent('latest'), /expected signed current/u)
 
+    fixture.config.expectedLegacyCurrent = EMERGENCY_LEGACY_PREDECESSOR
+    const recovered = await fixture.prepare()
+    const recoveredPlan = JSON.parse(await recovered.files.get(PUBLICATION_PLAN_FILENAME).read())
+    assert.equal(recoveredPlan.legacy_bootstrap_pointer.expected_current,
+      `${EMERGENCY_LEGACY_PREDECESSOR.bytes}:${EMERGENCY_LEGACY_PREDECESSOR.sha256}`)
+
     fixture.config.expectedLegacyCurrent = { bytes: LEGACY_TOMBSTONE.bytes, sha256: 'e'.repeat(64) }
-    await assert.rejects(fixture.prepare(), /exact 2\.0\.12 tombstone/u)
+    await assert.rejects(fixture.prepare(), /exact approved predecessor/u)
   })
 
   it('accepts a real optional blockmap only when the CI receipts bind every byte', async () => {
