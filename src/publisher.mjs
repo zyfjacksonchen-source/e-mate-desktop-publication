@@ -11,7 +11,7 @@ export const EXPECTED_ACTION_REPOSITORY = 'zyfjacksonchen-source/e-mate-desktop-
 export const PUBLIC_ORIGIN = 'https://pub-ada3f610c0234a76838f4e19fe2bb25e.r2.dev'
 export const EXPECTED_R2_BUCKET = 'emate-desktop-downloads'
 export const RELEASE_VERSION = '2.0.13'
-export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-manifest-v1\0', 'utf8')
+export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-manifest-v2\0', 'utf8')
 export const PERFORMANCE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-admission-v1\0', 'utf8')
 export const PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-aggregate-admission-v1\0', 'utf8')
 export const PERFORMANCE_EVIDENCE_FILENAME = 'e-mate-performance-evidence.json'
@@ -378,11 +378,11 @@ export async function prepareDesktopPublication(config, dependencies) {
   const signing = validateBaseAndSigningKey(base, {
     baseContractId: unsigned.base_contract_id,
     scheduleProtocolFloor: unsigned.schedule_protocol_floor,
-    signatureKeyId: unsigned.performance.signature_key_id,
+    signatureKeyId: config.signingKeyId,
   }, config)
 
   const provenance = unsigned.github_artifact_provenance
-  const [candidateReference, performanceReference] = provenance.artifacts
+  const [candidateReference] = provenance.artifacts
   if (unsigned.artifacts.darwin.build_run_id !== config.mainCiRunId
     || unsigned.artifacts.win32.build_run_id !== config.mainCiRunId) {
     throw new Error('Desktop installers are not owned by the exact protected-main CI run')
@@ -393,13 +393,6 @@ export async function prepareDesktopPublication(config, dependencies) {
     sourceCommit: config.sourceCommit,
     jobs: ['Bind exact protected-main CI artifacts to the release manifest'],
   })
-  const performanceArtifact = await validateProvenanceArtifact(github, performanceReference, {
-    path: '.github/workflows/desktop-performance.yml',
-    event: 'workflow_dispatch',
-    sourceCommit: config.sourceCommit,
-    jobs: ['Performance admission'],
-  })
-
   const candidateBundle = await github.downloadArtifact(candidateReference.artifact_id)
   assertDownloadedArtifact(candidateBundle, candidateArtifact)
   assertNoMacSmoke(candidateBundle.files)
@@ -446,55 +439,6 @@ export async function prepareDesktopPublication(config, dependencies) {
       archiveEntries,
     }
   }
-
-  const performanceBundle = await github.downloadArtifact(performanceReference.artifact_id)
-  assertDownloadedArtifact(performanceBundle, performanceArtifact)
-  assertNoMacSmoke(performanceBundle.files)
-  const performanceAdmissionSource = requiredFile(performanceBundle.files, 'performance-admission.json')
-  const performanceAdmissionBytes = await readSmall(performanceAdmissionSource)
-  const performanceAdmission = parsePrettyJson(performanceAdmissionBytes, 'performance admission')
-  validatePerformanceAggregateAdmission(
-    performanceAdmission,
-    performanceAdmissionBytes,
-    unsigned,
-    signing.publicKey,
-    config.signingKeyId,
-  )
-  const expectedPerformanceFiles = ['performance-admission.json']
-  for (const [index, model] of PERFORMANCE_MODEL_ROSTER.entries()) {
-    const prefix = performanceChildPrefix(index)
-    const child = performanceAdmission.children[index]
-    const leafAdmissionBytes = await readSmall(requiredFile(performanceBundle.files, `${prefix}/performance-admission.json`))
-    const leafAdmission = parsePrettyJson(leafAdmissionBytes, `${model.route_id} performance admission`)
-    const evidenceBytes = await readPerformanceFile(requiredFile(performanceBundle.files, `${prefix}/${PERFORMANCE_EVIDENCE_FILENAME}`))
-    const evidence = parsePrettyJson(evidenceBytes, `${model.route_id} performance evidence`)
-    const leafManifest = {
-      ...unsigned,
-      performance: {
-        performance_run_id: child.performance_run_id,
-        admission_sha256: child.admission_sha256,
-        signature_key_id: unsigned.performance.signature_key_id,
-        verifier: child.verifier,
-      },
-    }
-    validatePerformanceAdmission(
-      leafAdmission,
-      leafAdmissionBytes,
-      leafManifest,
-      signing.publicKey,
-      config.signingKeyId,
-    )
-    if (leafAdmission.performance_run_id !== child.performance_run_id
-      || sha256(leafAdmissionBytes) !== child.admission_sha256
-      || leafAdmission.evidence_sha256 !== child.evidence_sha256
-      || canonicalJson(leafAdmission.verifier) !== canonicalJson(child.verifier)) {
-      throw new Error(`performance aggregate child ${model.route_id} drifted`)
-    }
-    validateAdmittedPerformanceEvidence(evidence, evidenceBytes, leafAdmission, model)
-    expectedPerformanceFiles.push(...performanceEvidenceFiles(evidence).map(path => `${prefix}/${path}`))
-    expectedPerformanceFiles.push(`${prefix}/performance-admission.json`)
-  }
-  assertExactFileSet(performanceBundle.files, expectedPerformanceFiles)
 
   const signatureValue = sign(
     null,
@@ -570,12 +514,11 @@ export async function prepareDesktopPublication(config, dependencies) {
     main_ci_run_id: config.mainCiRunId,
     admission_artifact_id: config.admissionArtifactId,
     desktop_artifact_id: candidateReference.artifact_id,
-    performance_artifact_id: performanceReference.artifact_id,
     macos_staging_artifact_id: config.macosArtifactId,
     windows_staging_artifact_id: config.windowsArtifactId,
   }
   const publicationPlan = {
-    schema_version: 1,
+    schema_version: 2,
     document_type: 'emate.desktop-cloudflare-publication-plan',
     status: 'ready-for-cloudflare-plugin',
     publication_authority: 'codex-cloudflare-plugin',
@@ -600,7 +543,7 @@ export async function prepareDesktopPublication(config, dependencies) {
   }
   const publicationPlanBytes = Buffer.from(`${JSON.stringify(publicationPlan, null, 2)}\n`)
   const handoff = {
-    schema_version: 1,
+    schema_version: 2,
     document_type: 'emate.codex-cloudflare-plugin-handoff',
     status: 'ready-for-cloudflare-plugin',
     publication_authority: 'codex-cloudflare-plugin',
@@ -845,17 +788,16 @@ function validateUnsignedManifest(value, sourceCommit) {
   const keys = [
     'schema_version', 'document_type', 'release_status', 'version', 'source_commit',
     'base_contract_id', 'schedule_protocol_floor', 'profile_component_aggregate',
-    'performance', 'github_artifact_provenance', 'artifacts',
+    'github_artifact_provenance', 'artifacts',
   ]
-  if (!hasExactKeys(value, keys) || value.schema_version !== 1
+  if (!hasExactKeys(value, keys) || value.schema_version !== 2
     || value.document_type !== 'emate.desktop-release-manifest' || value.release_status !== 'admitted'
     || value.version !== RELEASE_VERSION || value.source_commit !== sourceCommit
     || !BASE_ID.test(value.base_contract_id) || !positiveInteger(value.schedule_protocol_floor)
     || !profileAggregate(value.profile_component_aggregate)
-    || !performanceSummary(value.performance)
     || !githubProvenance(value.github_artifact_provenance, sourceCommit)
     || !hasExactKeys(value.artifacts, ['darwin', 'win32'])) {
-    throw new Error('unsigned Desktop manifest is not the exact admitted 11-field schema')
+    throw new Error('unsigned Desktop manifest is not the exact admitted 10-field schema')
   }
   for (const platform of ['darwin', 'win32']) validateArtifactRecord(platform, value.artifacts[platform], value)
   canonicalJson(value)
@@ -878,12 +820,12 @@ function validateCandidate(candidate, manifest) {
   if (!hasExactKeys(candidate, [
     'schema_version', 'document_type', 'release_status', 'version', 'source_commit',
     'schedule_protocol_floor', 'artifacts',
-  ]) || candidate.schema_version !== 1 || candidate.document_type !== 'emate.desktop-artifact-candidate'
-    || candidate.release_status !== 'performance-pending' || candidate.version !== RELEASE_VERSION
+  ]) || candidate.schema_version !== 2 || candidate.document_type !== 'emate.desktop-artifact-candidate'
+    || candidate.release_status !== 'admission-pending' || candidate.version !== RELEASE_VERSION
     || candidate.source_commit !== manifest.source_commit
     || candidate.schedule_protocol_floor !== manifest.schedule_protocol_floor
     || canonicalJson(candidate.artifacts) !== canonicalJson(manifest.artifacts)) {
-    throw new Error('performance-pending candidate does not match the admitted manifest')
+    throw new Error('admission-pending candidate does not match the admitted manifest')
   }
 }
 
@@ -891,12 +833,12 @@ function validatePerformanceCandidate(candidate, sourceCommit, base) {
   if (!hasExactKeys(candidate, [
     'schema_version', 'document_type', 'release_status', 'version', 'source_commit',
     'schedule_protocol_floor', 'artifacts',
-  ]) || candidate.schema_version !== 1 || candidate.document_type !== 'emate.desktop-artifact-candidate'
-    || candidate.release_status !== 'performance-pending' || candidate.version !== RELEASE_VERSION
+  ]) || candidate.schema_version !== 2 || candidate.document_type !== 'emate.desktop-artifact-candidate'
+    || candidate.release_status !== 'admission-pending' || candidate.version !== RELEASE_VERSION
     || candidate.source_commit !== sourceCommit || !positiveInteger(candidate.schedule_protocol_floor)
     || candidate.schedule_protocol_floor !== base.schedule_protocol_floor
     || !hasExactKeys(candidate.artifacts, ['darwin', 'win32'])) {
-    throw new Error('performance-pending candidate identity is invalid')
+    throw new Error('admission-pending candidate identity is invalid')
   }
   for (const platform of ['darwin', 'win32']) validateArtifactRecord(platform, candidate.artifacts[platform], candidate)
 }
@@ -1191,7 +1133,7 @@ function validatePerformanceModelEvidence(evidence, input, model) {
 }
 
 function githubProvenance(value, sourceCommit) {
-  const roles = ['desktop_candidate', 'performance_admission']
+  const roles = ['desktop_candidate']
   return hasExactKeys(value, ['schema_version', 'document_type', 'source_commit', 'artifacts'])
     && value.schema_version === 1 && value.document_type === 'emate.github-artifact-provenance'
     && value.source_commit === sourceCommit && Array.isArray(value.artifacts)
@@ -1199,9 +1141,7 @@ function githubProvenance(value, sourceCommit) {
     && value.artifacts.every((artifact, index) => hasExactKeys(artifact, [
       'role', 'name', 'artifact_id', 'digest', 'run_id', 'run_attempt',
     ]) && artifact.role === roles[index]
-      && artifact.name === (index === 0
-        ? `e-mate-desktop-release-${sourceCommit}`
-        : performanceAdmissionArtifactName(sourceCommit, artifact.run_attempt))
+      && artifact.name === `e-mate-desktop-release-${sourceCommit}`
       && RUN_ID.test(artifact.artifact_id ?? '') && /^sha256:[0-9a-f]{64}$/u.test(artifact.digest ?? '')
       && RUN_ID.test(artifact.run_id ?? '') && artifact.run_attempt === 1)
 }
