@@ -4,6 +4,7 @@ const EXPECTED_BUCKET = 'emate-desktop-downloads'
 const INGEST_PATH = '/v1/ingest'
 const MAX_OBJECT_BYTES = 512 * 1024 * 1024
 const MAX_ARCHIVE_OVERHEAD = 256 * 1024
+const MAX_BLOCKMAP_BYTES = 32 * 1024 * 1024
 const MAX_REQUEST_BYTES = 8 * 1024
 const MAX_RANGE_BYTES = 66 * 1024
 const MAX_AUTH_WINDOW_MS = 15 * 60 * 1000
@@ -31,7 +32,11 @@ export async function handleRequest(request, env, dependencies = {}) {
     })
   } catch (error) {
     const safe = error instanceof BridgeError ? error : new BridgeError(500, 'internal')
-    return json({ ok: false, code: safe.code }, safe.status)
+    return json({
+      ok: false,
+      code: safe.code,
+      ...(safe.tempKey === undefined ? {} : { temp_key: safe.tempKey }),
+    }, safe.status)
   }
 }
 
@@ -73,6 +78,7 @@ async function ingest(request, env, dependencies) {
       sourceUrl,
       config.artifactPath,
       config.bytes,
+      config.archiveEntries,
       controller.signal,
     )
     const response = await dependencies.fetch(sourceUrl, {
@@ -112,6 +118,12 @@ async function ingest(request, env, dependencies) {
     } catch {
       throw new BridgeError(409, 'final-object-collision')
     }
+    try {
+      await env.RELEASES.delete(tempKey)
+      if (await env.RELEASES.get(tempKey) !== null) throw new Error('temporary object survived cleanup')
+    } catch {
+      throw new BridgeError(502, 'temp-cleanup-failed', tempKey)
+    }
 
     return json({
       ok: true,
@@ -122,9 +134,11 @@ async function ingest(request, env, dependencies) {
       plan_sha256: config.planSha256,
     }, 200)
   } catch (error) {
-    if (controller.signal.aborted) throw new BridgeError(504, 'transfer-timeout')
-    if (error instanceof BridgeError) throw error
-    throw new BridgeError(502, 'transfer-failed')
+    if (controller.signal.aborted) throw new BridgeError(504, 'transfer-timeout', tempKey)
+    if (error instanceof BridgeError) {
+      throw error.tempKey === undefined ? new BridgeError(error.status, error.code, tempKey) : error
+    }
+    throw new BridgeError(502, 'transfer-failed', tempKey)
   } finally {
     clearTimeout(timer)
   }
@@ -132,13 +146,15 @@ async function ingest(request, env, dependencies) {
 
 function validateConfig(env, now) {
   if (env?.EXPECTED_BUCKET !== EXPECTED_BUCKET || typeof env.RELEASES?.put !== 'function'
-    || typeof env.RELEASES?.get !== 'function' || typeof env.RELEASES?.createMultipartUpload !== 'function') {
+    || typeof env.RELEASES?.get !== 'function' || typeof env.RELEASES?.delete !== 'function'
+    || typeof env.RELEASES?.createMultipartUpload !== 'function') {
     throw new BridgeError(503, 'configuration-invalid')
   }
   const match = RELEASE_KEY.exec(env.EXPECTED_KEY ?? '')
   const bytes = Number(env.EXPECTED_BYTES)
   const expiresAt = Number(env.EXPIRES_AT)
   const sourceOrigin = strictSourceOrigin(env.EXPECTED_SOURCE_ORIGIN)
+  const archiveEntries = expectedArchiveEntries(env.EXPECTED_ARCHIVE_ENTRIES, env.EXPECTED_ARTIFACT_PATH, bytes)
   if (match === null || env.EXPECTED_ARTIFACT_PATH !== match[2]
     || !Number.isSafeInteger(bytes) || bytes <= 0 || bytes > MAX_OBJECT_BYTES
     || !SHA256.test(env.EXPECTED_SHA256 ?? '')
@@ -146,6 +162,7 @@ function validateConfig(env, now) {
     || !SHA256.test(env.EXPECTED_PLAN_SHA256 ?? '')
     || env.EXPECTED_CONTENT_TYPE !== BINARY_CONTENT_TYPE
     || env.EXPECTED_CACHE_CONTROL !== IMMUTABLE_CACHE
+    || archiveEntries === null
     || !TOKEN.test(env.AUTH_TOKEN ?? '')
     || !Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt - now > MAX_AUTH_WINDOW_MS
     || sourceOrigin === null
@@ -156,6 +173,7 @@ function validateConfig(env, now) {
   }
   return {
     artifactPath: env.EXPECTED_ARTIFACT_PATH,
+    archiveEntries,
     authToken: env.AUTH_TOKEN,
     bytes,
     cacheControl: env.EXPECTED_CACHE_CONTROL,
@@ -180,6 +198,39 @@ function strictSourceOrigin(value) {
   } catch {
     return null
   }
+}
+
+function expectedArchiveEntries(value, artifactPath, installerBytes) {
+  let entries
+  try {
+    if (typeof value !== 'string' || value.length > 2048) return null
+    entries = JSON.parse(value)
+  } catch {
+    return null
+  }
+  if (!Array.isArray(entries) || ![3, 4].includes(entries.length)) return null
+  const names = entries.map(entry => entry?.name)
+  const allowed = [
+    'desktop-artifact-receipt.json',
+    'desktop-runtime-verification.json',
+    artifactPath,
+  ]
+  if (entries.length === 4) allowed.push(`${artifactPath}.blockmap`)
+  if (JSON.stringify(names) !== JSON.stringify([...allowed].sort())) return null
+  if (new Set(names).size !== names.length || entries.some(entry => !hasExactKeys(entry, ['name', 'bytes'])
+    || !safeArchiveName(entry.name) || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0)) return null
+  for (const entry of entries) {
+    if (entry.name === artifactPath && entry.bytes !== installerBytes) return null
+    if (entry.name.endsWith('.json') && entry.bytes > 64 * 1024) return null
+    if (entry.name.endsWith('.blockmap') && entry.bytes > MAX_BLOCKMAP_BYTES) return null
+  }
+  return entries
+}
+
+function safeArchiveName(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 255
+    && !value.includes('/') && !value.includes('\\') && !/[\u0000-\u001f\u007f]/u.test(value)
+    && value !== '.' && value !== '..' && !value.startsWith('-')
 }
 
 function authenticate(request, expected) {
@@ -220,12 +271,14 @@ function validateSourceUrl(value, config) {
   return url.href
 }
 
-export async function inspectStoredArtifact(fetcher, sourceUrl, expectedName, expectedBytes, signal) {
+export async function inspectStoredArtifact(fetcher, sourceUrl, expectedName, expectedBytes, expectedEntries, signal) {
   const tail = await fetchRange(fetcher, sourceUrl, 'bytes=-65557', signal)
   const eocd = findEocd(tail)
-  if (eocd.entries !== 1 || eocd.commentBytes !== 0 || eocd.centralBytes <= 0
+  const expectedArchiveBytes = expectedEntries.reduce((sum, entry) => sum + entry.bytes, 0)
+  if (eocd.entries !== expectedEntries.length || eocd.commentBytes !== 0 || eocd.centralBytes <= 0
     || eocd.centralBytes > MAX_RANGE_BYTES || eocd.centralOffset + eocd.centralBytes !== eocd.offset
-    || eocd.archiveBytes < expectedBytes || eocd.archiveBytes > expectedBytes + MAX_ARCHIVE_OVERHEAD) {
+    || eocd.archiveBytes < expectedArchiveBytes
+    || eocd.archiveBytes > expectedArchiveBytes + MAX_ARCHIVE_OVERHEAD) {
     throw new BridgeError(422, 'archive-shape-invalid')
   }
   const central = await fetchRange(
@@ -234,18 +287,36 @@ export async function inspectStoredArtifact(fetcher, sourceUrl, expectedName, ex
     `bytes=${eocd.centralOffset}-${eocd.offset - 1}`,
     signal,
   )
-  const entry = parseCentralEntry(central.bytes, expectedName, expectedBytes)
-  if (entry.localOffset !== 0) throw new BridgeError(422, 'archive-shape-invalid')
+  const entries = parseCentralEntries(central.bytes, expectedEntries)
+  const entry = entries.find(item => item.name === expectedName)
+  if (entry === undefined || entry.uncompressedBytes !== expectedBytes) {
+    throw new BridgeError(422, 'archive-shape-invalid')
+  }
 
-  const localFixed = await fetchRange(fetcher, sourceUrl, 'bytes=0-29', signal)
+  const localFixed = await fetchRange(
+    fetcher,
+    sourceUrl,
+    `bytes=${entry.localOffset}-${entry.localOffset + 29}`,
+    signal,
+  )
   const local = parseLocalEntry(localFixed.bytes)
   const localTailBytes = local.nameBytes + local.extraBytes
   if (localTailBytes <= 0 || localTailBytes > MAX_RANGE_BYTES) throw new BridgeError(422, 'archive-shape-invalid')
-  const localTail = await fetchRange(fetcher, sourceUrl, `bytes=30-${29 + localTailBytes}`, signal)
+  const localTailStart = entry.localOffset + 30
+  const localTail = await fetchRange(
+    fetcher,
+    sourceUrl,
+    `bytes=${localTailStart}-${localTailStart + localTailBytes - 1}`,
+    signal,
+  )
   validateLocalEntry(local, localTail.bytes, entry, expectedName, expectedBytes)
-  const dataOffset = 30 + localTailBytes
+  const dataOffset = localTailStart + localTailBytes
   const dataEnd = dataOffset + expectedBytes
-  await validateDescriptor(fetcher, sourceUrl, dataEnd, eocd.centralOffset, entry, signal)
+  const boundary = Math.min(
+    eocd.centralOffset,
+    ...entries.filter(item => item.localOffset > entry.localOffset).map(item => item.localOffset),
+  )
+  await validateDescriptor(fetcher, sourceUrl, dataEnd, boundary, entry, signal)
   return { archiveBytes: eocd.archiveBytes, dataOffset, dataEnd, entryBytes: expectedBytes }
 }
 
@@ -315,30 +386,46 @@ function findEocd(range) {
   throw new BridgeError(422, 'archive-shape-invalid')
 }
 
-function parseCentralEntry(bytes, expectedName, expectedBytes) {
-  if (bytes.byteLength < 46) throw new BridgeError(422, 'archive-shape-invalid')
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  const flags = view.getUint16(8, true)
-  const compressedBytes = view.getUint32(20, true)
-  const uncompressedBytes = view.getUint32(24, true)
-  const nameBytes = view.getUint16(28, true)
-  const extraBytes = view.getUint16(30, true)
-  const commentBytes = view.getUint16(32, true)
-  const total = 46 + nameBytes + extraBytes + commentBytes
-  if (view.getUint32(0, true) !== 0x02014b50 || view.getUint16(10, true) !== 0
-    || (flags & ~ALLOWED_ZIP_FLAGS) !== 0 || view.getUint16(34, true) !== 0
-    || compressedBytes !== expectedBytes || uncompressedBytes !== expectedBytes
-    || commentBytes !== 0 || total !== bytes.byteLength
-    || decodeName(bytes.subarray(46, 46 + nameBytes)) !== expectedName) {
-    throw new BridgeError(422, 'archive-shape-invalid')
+function parseCentralEntries(bytes, expectedEntries) {
+  const expected = new Map(expectedEntries.map(entry => [entry.name, entry]))
+  const entries = []
+  const seenOffsets = new Set()
+  let offset = 0
+  while (offset < bytes.byteLength) {
+    if (bytes.byteLength - offset < 46) throw new BridgeError(422, 'archive-shape-invalid')
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset, bytes.byteLength - offset)
+    const flags = view.getUint16(8, true)
+    const compressedBytes = view.getUint32(20, true)
+    const uncompressedBytes = view.getUint32(24, true)
+    const nameBytes = view.getUint16(28, true)
+    const extraBytes = view.getUint16(30, true)
+    const commentBytes = view.getUint16(32, true)
+    const total = 46 + nameBytes + extraBytes + commentBytes
+    if (view.getUint32(0, true) !== 0x02014b50 || view.getUint16(10, true) !== 0
+      || (flags & ~ALLOWED_ZIP_FLAGS) !== 0 || view.getUint16(34, true) !== 0
+      || commentBytes !== 0 || extraBytes > 4096 || total > bytes.byteLength - offset) {
+      throw new BridgeError(422, 'archive-shape-invalid')
+    }
+    const name = decodeName(bytes.subarray(offset + 46, offset + 46 + nameBytes))
+    const wanted = expected.get(name)
+    const localOffset = view.getUint32(42, true)
+    if (!safeArchiveName(name) || wanted === undefined || entries.some(entry => entry.name === name)
+      || seenOffsets.has(localOffset) || compressedBytes !== wanted.bytes || uncompressedBytes !== wanted.bytes) {
+      throw new BridgeError(422, 'archive-shape-invalid')
+    }
+    seenOffsets.add(localOffset)
+    entries.push({
+      name,
+      compressedBytes,
+      crc32: view.getUint32(16, true),
+      flags,
+      localOffset,
+      uncompressedBytes,
+    })
+    offset += total
   }
-  return {
-    compressedBytes,
-    crc32: view.getUint32(16, true),
-    flags,
-    localOffset: view.getUint32(42, true),
-    uncompressedBytes,
-  }
+  if (entries.length !== expectedEntries.length) throw new BridgeError(422, 'archive-shape-invalid')
+  return entries
 }
 
 function parseLocalEntry(bytes) {
@@ -537,9 +624,10 @@ function json(value, status) {
 }
 
 class BridgeError extends Error {
-  constructor(status, code) {
+  constructor(status, code, tempKey) {
     super(code)
     this.status = status
     this.code = code
+    this.tempKey = tempKey
   }
 }

@@ -25,11 +25,12 @@
   "lifecycle": {
     "one_artifact_per_deployment": true,
     "one_time_random_bearer_secret": "AUTH_TOKEN",
+    "temp_cleanup_only": true,
     "delete_worker_after_call": true
   },
   "forbidden_operations": [
     "bucket-list",
-    "object-delete",
+    "arbitrary-object-delete",
     "pointer-write",
     "final-overwrite",
     "credential-log"

@@ -11,10 +11,10 @@ inputs:
     description: Successful attempt-1 protected-main desktop-admission artifact containing only the unsigned manifest and Base contract.
     required: true
   macos-artifact-id:
-    description: Exact compression-level-0 single-file e-mate-desktop-macos-<sha> staging artifact from the admitted Desktop run.
+    description: Exact closed compression-level-0 e-mate-desktop-macos-<sha> staging artifact from the admitted CI run.
     required: true
   windows-artifact-id:
-    description: Exact compression-level-0 single-file e-mate-desktop-windows-<sha> staging artifact from the admitted Windows build run.
+    description: Exact closed compression-level-0 e-mate-desktop-windows-<sha> staging artifact from the admitted CI run.
     required: true
   expected-signed-current:
     description: Literal absent, or the exact current desktop/signed/latest.json identity as <bytes>:<sha256>, for the Cloudflare plugin to recheck before activation.
