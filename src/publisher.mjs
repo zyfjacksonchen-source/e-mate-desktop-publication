@@ -10,7 +10,7 @@ export const EXPECTED_REPOSITORY = 'zyfjacksonchen-source/e-Mate-2.0.11'
 export const EXPECTED_ACTION_REPOSITORY = 'zyfjacksonchen-source/e-mate-desktop-publication'
 export const PUBLIC_ORIGIN = 'https://pub-ada3f610c0234a76838f4e19fe2bb25e.r2.dev'
 export const EXPECTED_R2_BUCKET = 'emate-desktop-downloads'
-export const RELEASE_VERSION = '2.0.13'
+export const RELEASE_VERSION = '2.0.14'
 export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-manifest-v2\0', 'utf8')
 export const PERFORMANCE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-admission-v1\0', 'utf8')
 export const PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-aggregate-admission-v1\0', 'utf8')
@@ -30,17 +30,11 @@ export const DESKTOP_RELEASE_ARTIFACT_NAMES = Object.freeze({
 export const DESKTOP_RELEASE_ARTIFACT_FILES = Object.freeze(Object.values(DESKTOP_RELEASE_ARTIFACT_NAMES))
 const DESKTOP_CI_RECEIPT = 'desktop-artifact-receipt.json'
 const DESKTOP_RUNTIME_RECEIPT = 'desktop-runtime-verification.json'
-export const LEGACY_TOMBSTONE = Object.freeze({
+export const LEGACY_PREDECESSOR = Object.freeze({
   key: 'desktop/latest.json',
-  bytes: 948,
-  sha256: 'e6d5e045364bdac97ea7fef41b1e28a20af06c9f4ffdd85d2c136e982d12a7dc',
+  bytes: 2961,
+  sha256: 'd26b9ffb5f30531bc5de6c9f66aab47c3718248e2ff109d82cd3a763f0c02887',
 })
-export const EMERGENCY_LEGACY_PREDECESSOR = Object.freeze({
-  key: LEGACY_TOMBSTONE.key,
-  bytes: 948,
-  sha256: '1d70004c726e458525205dd370ebea595b3121ffd2afe49d7c65d646c4ac19c4',
-})
-const LEGACY_PREDECESSORS = [LEGACY_TOMBSTONE, EMERGENCY_LEGACY_PREDECESSOR]
 
 const SHA256 = /^[0-9a-f]{64}$/u
 const SHA40 = /^[0-9a-f]{40}$/u
@@ -501,8 +495,8 @@ export async function prepareDesktopPublication(config, dependencies) {
   }
   const legacyBootstrapPointer = {
     execution_order: 'last',
-    key: LEGACY_TOMBSTONE.key,
-    url: `${PUBLIC_ORIGIN}/${LEGACY_TOMBSTONE.key}`,
+    key: LEGACY_PREDECESSOR.key,
+    url: `${PUBLIC_ORIGIN}/${LEGACY_PREDECESSOR.key}`,
     expected_current: formatExpectedCurrent(config.expectedLegacyCurrent),
     artifact_path: SIGNED_MANIFEST_FILENAME,
     bytes: signedBytes.byteLength,
@@ -610,8 +604,8 @@ function validateInvocation(config) {
     || config.expectedSignedCurrent.bytes <= 0 || !SHA256.test(config.expectedSignedCurrent.sha256))) {
     throw new Error('expected signed pointer identity is invalid')
   }
-  if (!LEGACY_PREDECESSORS.some(predecessor => config.expectedLegacyCurrent?.bytes === predecessor.bytes
-    && config.expectedLegacyCurrent.sha256 === predecessor.sha256)) {
+  if (config.expectedLegacyCurrent?.bytes !== LEGACY_PREDECESSOR.bytes
+    || config.expectedLegacyCurrent.sha256 !== LEGACY_PREDECESSOR.sha256) {
     throw new Error('expected legacy pointer is not an exact approved predecessor')
   }
 }

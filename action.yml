@@ -1,5 +1,5 @@
 name: e-Mate Desktop Cloudflare plugin handoff
-description: Verify one admitted e-Mate 2.0.13 Desktop release, sign it, then emit a byte-bound Codex Cloudflare plugin publication plan without accessing R2.
+description: Verify one admitted e-Mate 2.0.14 Desktop release, sign it, then emit a byte-bound Codex Cloudflare plugin publication plan without accessing R2.
 inputs:
   source-sha:
     description: Exact protected-main source commit bound by CI and every release artifact.

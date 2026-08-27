@@ -7,10 +7,9 @@ import { fileURLToPath } from 'node:url'
 import {
   CLOUDFLARE_HANDOFF_FILENAME,
   DESKTOP_RELEASE_ARTIFACT_FILES,
-  EMERGENCY_LEGACY_PREDECESSOR,
   EXPECTED_ACTION_REPOSITORY,
   EXPECTED_REPOSITORY,
-  LEGACY_TOMBSTONE,
+  LEGACY_PREDECESSOR,
   PUBLICATION_PLAN_FILENAME,
   PUBLIC_ORIGIN,
   RELEASE_SIGNATURE_CONTEXT,
@@ -73,9 +72,9 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     assert.equal(plan.active_pointer.cache_control, 'no-store')
     assert.deepEqual(plan.legacy_bootstrap_pointer, {
       execution_order: 'last',
-      key: LEGACY_TOMBSTONE.key,
-      url: `${PUBLIC_ORIGIN}/${LEGACY_TOMBSTONE.key}`,
-      expected_current: `${LEGACY_TOMBSTONE.bytes}:${LEGACY_TOMBSTONE.sha256}`,
+      key: LEGACY_PREDECESSOR.key,
+      url: `${PUBLIC_ORIGIN}/${LEGACY_PREDECESSOR.key}`,
+      expected_current: `${LEGACY_PREDECESSOR.bytes}:${LEGACY_PREDECESSOR.sha256}`,
       artifact_path: SIGNED_MANIFEST_FILENAME,
       bytes: signedBytes.byteLength,
       sha256: sha256(signedBytes),
@@ -96,12 +95,12 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     assert.deepEqual(mac.github_archive_entries.map(item => item.name), [
       'desktop-artifact-receipt.json',
       'desktop-runtime-verification.json',
-      'e-Mate-2.0.13-mac-universal.dmg',
+      'e-Mate-2.0.14-mac-universal.dmg',
     ])
     assert.deepEqual(win.github_archive_entries.map(item => item.name), [
       'desktop-artifact-receipt.json',
       'desktop-runtime-verification.json',
-      'e-Mate-2.0.13-win-x64-Setup.exe',
+      'e-Mate-2.0.14-win-x64-Setup.exe',
     ])
     assert.equal(manual.artifact_path, SIGNED_MANIFEST_FILENAME)
     for (const field of ['bytes', 'sha256', 'content_type']) {
@@ -139,13 +138,12 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     assert.deepEqual(parseExpectedCurrent(`123:${'f'.repeat(64)}`), fixture.config.expectedSignedCurrent)
     assert.throws(() => parseExpectedCurrent('latest'), /expected signed current/u)
 
-    fixture.config.expectedLegacyCurrent = EMERGENCY_LEGACY_PREDECESSOR
-    const recovered = await fixture.prepare()
-    const recoveredPlan = JSON.parse(await recovered.files.get(PUBLICATION_PLAN_FILENAME).read())
-    assert.equal(recoveredPlan.legacy_bootstrap_pointer.expected_current,
-      `${EMERGENCY_LEGACY_PREDECESSOR.bytes}:${EMERGENCY_LEGACY_PREDECESSOR.sha256}`)
+    assert.deepEqual(fixture.config.expectedLegacyCurrent, {
+      bytes: LEGACY_PREDECESSOR.bytes,
+      sha256: LEGACY_PREDECESSOR.sha256,
+    })
 
-    fixture.config.expectedLegacyCurrent = { bytes: LEGACY_TOMBSTONE.bytes, sha256: 'e'.repeat(64) }
+    fixture.config.expectedLegacyCurrent = { bytes: LEGACY_PREDECESSOR.bytes, sha256: 'e'.repeat(64) }
     await assert.rejects(fixture.prepare(), /exact approved predecessor/u)
   })
 
@@ -154,13 +152,13 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     fixture.github.replaceStagingFiles('206', stagingFiles('darwin', Buffer.from('exact-mac-installer'), Buffer.from('exact-blockmap')))
     const result = await fixture.prepare()
     const plan = JSON.parse(await result.files.get(PUBLICATION_PLAN_FILENAME).read())
-    assert.equal(plan.immutable_objects[0].artifact_path, 'e-Mate-2.0.13-mac-universal.dmg')
+    assert.equal(plan.immutable_objects[0].artifact_path, 'e-Mate-2.0.14-mac-universal.dmg')
     assert.equal(plan.immutable_objects.some(item => item.artifact_path.endsWith('.blockmap')), false)
     assert.deepEqual(plan.immutable_objects[0].github_archive_entries.map(item => item.name), [
       'desktop-artifact-receipt.json',
       'desktop-runtime-verification.json',
-      'e-Mate-2.0.13-mac-universal.dmg',
-      'e-Mate-2.0.13-mac-universal.dmg.blockmap',
+      'e-Mate-2.0.14-mac-universal.dmg',
+      'e-Mate-2.0.14-mac-universal.dmg.blockmap',
     ])
   })
 
@@ -199,7 +197,7 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
         fixture.github.artifacts.get('206').bundle.files.set('mac-smoke.dmg', testSource('smoke'))
       }],
       ['symlink payload cannot replace exact installer bytes', fixture => {
-        fixture.github.replaceFile('206', 'e-Mate-2.0.13-mac-universal.dmg', Buffer.from('../outside'))
+        fixture.github.replaceFile('206', 'e-Mate-2.0.14-mac-universal.dmg', Buffer.from('../outside'))
       }],
       ['staging artifact name drift', fixture => {
         fixture.github.artifacts.get('206').metadata.name = 'other'
@@ -208,13 +206,13 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
         fixture.github.artifacts.get('207').metadata.runId = '101'
       }],
       ['compressed staging entry', fixture => {
-        fixture.github.artifacts.get('206').bundle.stored.delete('e-Mate-2.0.13-mac-universal.dmg')
+        fixture.github.artifacts.get('206').bundle.stored.delete('e-Mate-2.0.14-mac-universal.dmg')
       }],
       ['compressed staging receipt', fixture => {
         fixture.github.artifacts.get('206').bundle.stored.delete('desktop-artifact-receipt.json')
       }],
       ['final installer bytes drift', fixture => {
-        fixture.github.replaceFile('202', 'e-Mate-2.0.13-win-x64-Setup.exe', Buffer.from('other'))
+        fixture.github.replaceFile('202', 'e-Mate-2.0.14-win-x64-Setup.exe', Buffer.from('other'))
       }],
       ['Base trust-key drift', fixture => {
         const base = JSON.parse(fixture.github.file('201', 'base-contract.json').buffer)
@@ -264,11 +262,11 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
 
   it('accepts only a ZIP stored entry for the range-stream installer source', () => {
     const listing = [
-      '      19  Stored       19   0% 08-25-2026 00:00 00000000  e-Mate-2.0.13-mac-universal.dmg',
-      '      20  Defl:N       18  10% 08-25-2026 00:00 00000000  e-Mate-2.0.13-win-x64-Setup.exe',
+      '      19  Stored       19   0% 08-25-2026 00:00 00000000  e-Mate-2.0.14-mac-universal.dmg',
+      '      20  Defl:N       18  10% 08-25-2026 00:00 00000000  e-Mate-2.0.14-win-x64-Setup.exe',
     ].join('\n')
     assert.deepEqual([...parseStoredArchiveEntries(listing, DESKTOP_RELEASE_ARTIFACT_FILES.slice(1))], [
-      'e-Mate-2.0.13-mac-universal.dmg',
+      'e-Mate-2.0.14-mac-universal.dmg',
     ])
   })
 })
@@ -313,7 +311,7 @@ function releaseFixture() {
     schema_version: 2,
     document_type: 'emate.desktop-release-manifest',
     release_status: 'admitted',
-    version: '2.0.13',
+    version: '2.0.14',
     source_commit: SOURCE,
     base_contract_id: BASE_ID,
     schedule_protocol_floor: 1,
@@ -325,7 +323,7 @@ function releaseFixture() {
     schema_version: 2,
     document_type: 'emate.desktop-artifact-candidate',
     release_status: 'admission-pending',
-    version: '2.0.13',
+    version: '2.0.14',
     source_commit: SOURCE,
     schedule_protocol_floor: 1,
     artifacts,
@@ -364,8 +362,8 @@ function releaseFixture() {
       }),
       artifact('202', `e-mate-desktop-release-${SOURCE}`, '102', candidateBundleSha, {
         'desktop-candidate.json': pretty(candidate),
-        'e-Mate-2.0.13-mac-universal.dmg': mac,
-        'e-Mate-2.0.13-win-x64-Setup.exe': win,
+        'e-Mate-2.0.14-mac-universal.dmg': mac,
+        'e-Mate-2.0.14-win-x64-Setup.exe': win,
       }),
       artifact('206', `e-mate-desktop-macos-${SOURCE}`, '100', 'a'.repeat(64), stagingFiles('darwin', mac)),
       artifact('207', `e-mate-desktop-windows-${SOURCE}`, '100', 'b'.repeat(64), stagingFiles('win32', win)),
@@ -385,7 +383,7 @@ function releaseFixture() {
     macosArtifactId: '206',
     windowsArtifactId: '207',
     expectedSignedCurrent: null,
-    expectedLegacyCurrent: { bytes: LEGACY_TOMBSTONE.bytes, sha256: LEGACY_TOMBSTONE.sha256 },
+    expectedLegacyCurrent: { bytes: LEGACY_PREDECESSOR.bytes, sha256: LEGACY_PREDECESSOR.sha256 },
     signingKeyId: KEY_ID,
     privateKeyPem,
   }
@@ -482,8 +480,8 @@ function testSource(bytes) {
 
 function stagingFiles(platform, installer, blockmap) {
   const installerName = platform === 'darwin'
-    ? 'e-Mate-2.0.13-mac-universal.dmg'
-    : 'e-Mate-2.0.13-win-x64-Setup.exe'
+    ? 'e-Mate-2.0.14-mac-universal.dmg'
+    : 'e-Mate-2.0.14-win-x64-Setup.exe'
   const runtime = pretty({
     schema_version: 1,
     document_type: 'emate.desktop-runtime-verification',
@@ -525,10 +523,10 @@ function stagingFiles(platform, installer, blockmap) {
 
 function manifestArtifact(platform, bytes, buildRunId) {
   const filename = platform === 'darwin'
-    ? 'e-Mate-2.0.13-mac-universal.dmg'
-    : 'e-Mate-2.0.13-win-x64-Setup.exe'
+    ? 'e-Mate-2.0.14-mac-universal.dmg'
+    : 'e-Mate-2.0.14-win-x64-Setup.exe'
   return {
-    url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.13/${SOURCE}/${filename}`,
+    url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.14/${SOURCE}/${filename}`,
     bytes: bytes.byteLength,
     sha256: sha256(bytes),
     build_source_commit: SOURCE,

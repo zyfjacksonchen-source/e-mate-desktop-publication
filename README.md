@@ -14,7 +14,7 @@ status is only `ready-for-cloudflare-plugin`.
 Both actions are deliberately pinned to:
 
 - caller repository `zyfjacksonchen-source/e-Mate-2.0.11`;
-- release `2.0.13`;
+- release `2.0.14`;
 - protected branch `main` with strict required check `CI admission`, administrator enforcement, linear history, and no force-push or deletion;
 - public origin `https://pub-ada3f610c0234a76838f4e19fe2bb25e.r2.dev`;
 - bucket `emate-desktop-downloads`;
@@ -38,7 +38,7 @@ Inputs:
 | `macos-artifact-id` | Exact closed `e-mate-desktop-macos-<sha>` staging artifact from the admitted CI run |
 | `windows-artifact-id` | Exact closed `e-mate-desktop-windows-<sha>` staging artifact from the admitted CI run |
 | `expected-signed-current` | Literal `absent`, or exact `<bytes>:<sha256>` for the plugin to recheck before activation |
-| `expected-legacy-current` | Exact approved `desktop/latest.json` predecessor `<bytes>:<sha256>` for the final migration CAS; only the frozen 2.0.12 tombstone and the immutable emergency 2.0.13 receipt are accepted |
+| `expected-legacy-current` | Exact approved `desktop/latest.json` predecessor `<bytes>:<sha256>` for the final bridge CAS; only the frozen final 2.0.13 signed manifest identity is accepted |
 | `signing-key-id` | Existing key in the admitted Base `profile_signing_keys` |
 
 The protected admission artifact must contain exactly:
@@ -102,7 +102,7 @@ the public key already present in the admitted Base.
 - signed-manifest identity, bytes, SHA-256, Base, schedule protocol, and key ID;
 - macOS installer, Windows installer, and manual signed manifest as immutable objects;
 - `desktop/signed/latest.json` as the Base v7 active pointer, with exact expected current and `no-store`;
-- `desktop/latest.json` as the one monotonic bootstrap pointer, CAS-bound to either the frozen 2.0.12 tombstone or the exact immutable emergency 2.0.13 predecessor and changed last to the same signed manifest bytes.
+- `desktop/latest.json` as the one corrective bootstrap pointer, CAS-bound to the exact frozen final 2.0.13 manifest and changed last to the same 2.0.14 signed manifest bytes.
 
 The manual immutable manifest and both active pointers reference the same
 `desktop-release-signed.json` bytes and SHA-256. The signed bytes are also
@@ -118,7 +118,7 @@ write, public readback, or pointer change occurred.
 The caller should upload this directory unchanged as
 `e-mate-desktop-cloudflare-handoff-<sha>`. The connected Codex Cloudflare plugin
 is the sole production writer. It must independently check the plan, expected
-tombstone, both expected active pointers, immutable-object collisions, uploaded
+predecessor, both expected active pointers, immutable-object collisions, uploaded
 bytes, metadata, and public readback before changing the signed pointer and then
 the legacy bootstrap pointer last.
 
