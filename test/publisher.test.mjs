@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { createHash, generateKeyPairSync, verify } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   CLOUDFLARE_HANDOFF_FILENAME,
   DESKTOP_RELEASE_ARTIFACT_FILES,
@@ -25,6 +27,16 @@ const BASE_ID = `e-mate-desktop-profile-v7-dsh-${SOURCE.slice(0, 12)}`
 const KEY_ID = 'e0a81164526dcbcd'
 
 describe('external Desktop Cloudflare plugin handoff owner', () => {
+  it('initializes the GitHub client before running the executable entrypoint', () => {
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL('../src/main.mjs', import.meta.url))], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '' },
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /required publication binding GITHUB_REPOSITORY is missing/u)
+    assert.doesNotMatch(result.stderr, /before initialization/u)
+  })
+
   it('verifies protected evidence, signs once, and emits only a closed three-file handoff', async () => {
     const fixture = releaseFixture()
     const result = await fixture.prepare()

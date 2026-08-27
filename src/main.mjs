@@ -92,10 +92,6 @@ async function materializeOutputFiles(files, root) {
   }
 }
 
-if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await main()
-}
-
 export class GithubClient {
   #repository
   #token
@@ -418,4 +414,8 @@ async function setOutput(name, value) {
 
 function singleLine(value) {
   return String(value).replace(/[\r\n]+/gu, ' ').slice(0, 1000)
+}
+
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main()
 }
