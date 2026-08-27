@@ -234,7 +234,7 @@ function performanceFixture() {
     schema_version: 2,
     document_type: 'emate.desktop-artifact-candidate',
     release_status: 'admission-pending',
-    version: '2.0.13',
+    version: '2.0.14',
     source_commit: SOURCE,
     schedule_protocol_floor: 1,
     artifacts: {
@@ -289,8 +289,8 @@ function performanceFixture() {
     artifacts: [
       githubArtifact('202', `e-mate-desktop-release-${SOURCE}`, '102', {
         'desktop-candidate.json': pretty(candidate),
-        'e-Mate-2.0.13-mac-universal.dmg': mac,
-        'e-Mate-2.0.13-win-x64-Setup.exe': win,
+        'e-Mate-2.0.14-mac-universal.dmg': mac,
+        'e-Mate-2.0.14-win-x64-Setup.exe': win,
       }),
       githubArtifact('203', performanceEvidenceArtifactName(SOURCE, 1), '103', {
         [PERFORMANCE_EVIDENCE_FILENAME]: pretty(evidence),
@@ -467,7 +467,7 @@ function performanceEvidence(candidate, aggregate) {
   }
   return {
     schema_version: 2,
-    comparison_kind: 'installed-2.0.12-vs-2.0.13',
+    comparison_kind: 'installed-2.0.12-vs-2.0.14',
     performance_run_id: 'production-performance-run-1',
     evidence_kind: 'production-real-provider',
     harness_commit: HARNESS,
@@ -487,10 +487,10 @@ function supportingPaths(evidence) {
 
 function artifactRecord(platform, bytes) {
   const name = platform === 'darwin'
-    ? 'e-Mate-2.0.13-mac-universal.dmg'
-    : 'e-Mate-2.0.13-win-x64-Setup.exe'
+    ? 'e-Mate-2.0.14-mac-universal.dmg'
+    : 'e-Mate-2.0.14-win-x64-Setup.exe'
   return {
-    url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.13/${SOURCE}/${name}`,
+    url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.14/${SOURCE}/${name}`,
     bytes: bytes.byteLength,
     sha256: sha256(bytes),
     build_source_commit: SOURCE,
@@ -526,6 +526,6 @@ function sha256(bytes) { return createHash('sha256').update(bytes).digest('hex')
 
 assert.deepEqual(DESKTOP_RELEASE_ARTIFACT_FILES, [
   'desktop-candidate.json',
-  'e-Mate-2.0.13-mac-universal.dmg',
-  'e-Mate-2.0.13-win-x64-Setup.exe',
+  'e-Mate-2.0.14-mac-universal.dmg',
+  'e-Mate-2.0.14-win-x64-Setup.exe',
 ])

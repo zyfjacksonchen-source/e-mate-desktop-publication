@@ -14,7 +14,7 @@ const BINARY_CONTENT_TYPE = 'application/octet-stream'
 const TOKEN = /^[A-Za-z0-9_-]{43}$/u
 const SHA256 = /^[0-9a-f]{64}$/u
 const ARTIFACT_DIGEST = /^sha256:([0-9a-f]{64})$/u
-const RELEASE_KEY = /^desktop\/releases\/v2\.0\.13\/([0-9a-f]{40})\/(e-Mate-2\.0\.13-(?:mac-universal\.dmg|win-x64-Setup\.exe))$/u
+const RELEASE_KEY = /^desktop\/releases\/v2\.0\.14\/([0-9a-f]{40})\/(e-Mate-2\.0\.14-(?:mac-universal\.dmg|win-x64-Setup\.exe))$/u
 const GITHUB_BLOB_HOST = /^productionresultssa[0-9]+\.blob\.core\.windows\.net$/u
 const ALLOWED_ZIP_FLAGS = (1 << 3) | (1 << 11)
 

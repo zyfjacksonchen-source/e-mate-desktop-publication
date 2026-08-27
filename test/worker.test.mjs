@@ -8,8 +8,8 @@ const NOW = 1_787_680_000_000
 const SOURCE = 'a'.repeat(40)
 const PLAN = 'b'.repeat(64)
 const TOKEN = 'A'.repeat(43)
-const ARTIFACT = 'e-Mate-2.0.13-mac-universal.dmg'
-const KEY = `desktop/releases/v2.0.13/${SOURCE}/${ARTIFACT}`
+const ARTIFACT = 'e-Mate-2.0.14-mac-universal.dmg'
+const KEY = `desktop/releases/v2.0.14/${SOURCE}/${ARTIFACT}`
 const ORIGIN = 'https://productionresultssa0.blob.core.windows.net'
 const SOURCE_PATH = '/actions-results/unit/staging.zip'
 const SOURCE_URL = `${ORIGIN}${SOURCE_PATH}?sig=short-lived`
