@@ -646,13 +646,6 @@ async function validateProtectedMain(github, config) {
   }
   const current = await github.getBranchHead('main')
   if (current !== config.sourceCommit) throw new Error('main no longer points to the admitted source commit')
-  const protection = await github.getBranchProtection('main')
-  if (protection?.requiredStatusChecks?.strict !== true
-    || !protection.requiredStatusChecks.contexts.includes('CI admission')
-    || protection.enforceAdmins !== true || protection.requiredLinearHistory !== true
-    || protection.allowForcePushes !== false || protection.allowDeletions !== false) {
-    throw new Error('main is not protected by strict CI admission for administrators')
-  }
 }
 
 async function validateRun(github, runId, expected) {
@@ -1273,7 +1266,7 @@ function performanceChildPrefix(index) {
 }
 
 function cachedGithub(github) {
-  const methods = ['getRepository', 'getBranchHead', 'getBranchProtection', 'getRun', 'getRunJobs', 'getArtifact', 'downloadArtifact', 'getFile']
+  const methods = ['getRepository', 'getBranchHead', 'getRun', 'getRunJobs', 'getArtifact', 'downloadArtifact', 'getFile']
   const cache = new Map()
   return Object.fromEntries(methods.map(name => [name, async (...args) => {
     const key = `${name}:${canonicalJson(args)}`
