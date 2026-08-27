@@ -121,24 +121,6 @@ export class GithubClient {
     return value?.object?.sha
   }
 
-  async getBranchProtection(branch) {
-    const value = await this.#json(`/repos/${this.#repository}/branches/${encodeURIComponent(branch)}/protection`)
-    const contexts = [
-      ...(value?.required_status_checks?.contexts ?? []),
-      ...(value?.required_status_checks?.checks ?? []).map(check => check?.context),
-    ].filter(context => typeof context === 'string')
-    return {
-      requiredStatusChecks: {
-        strict: value?.required_status_checks?.strict === true,
-        contexts: [...new Set(contexts)],
-      },
-      enforceAdmins: value?.enforce_admins?.enabled === true,
-      requiredLinearHistory: value?.required_linear_history?.enabled === true,
-      allowForcePushes: value?.allow_force_pushes?.enabled === true,
-      allowDeletions: value?.allow_deletions?.enabled === true,
-    }
-  }
-
   async getRun(runId) {
     const value = await this.#json(`/repos/${this.#repository}/actions/runs/${encodeURIComponent(runId)}`)
     return {

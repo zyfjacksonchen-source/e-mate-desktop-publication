@@ -167,7 +167,7 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
   it('fails closed on authority, provenance, closed-schema, staging, or trust drift', async t => {
     const cases = [
       ['unexpected repository', fixture => { fixture.config.repository = 'zyfjacksonchen-source/e-Mate' }],
-      ['unprotected main', fixture => { fixture.github.protection.enforceAdmins = false }],
+      ['unprotected main', fixture => { fixture.config.refProtected = false }],
       ['private repository', fixture => { fixture.github.repository.visibility = 'private' }],
       ['failed CI', fixture => { fixture.github.jobs.get('100')[0].conclusion = 'failure' }],
       ['rerun CI', fixture => { fixture.github.runs.get('100').runAttempt = 2 }],
@@ -407,13 +407,6 @@ class FakeGithub {
       archived: false,
       disabled: false,
     }
-    this.protection = {
-      requiredStatusChecks: { strict: true, contexts: ['CI admission'] },
-      enforceAdmins: true,
-      requiredLinearHistory: true,
-      allowForcePushes: false,
-      allowDeletions: false,
-    }
     this.runs = new Map([
       ['100', run('100', '.github/workflows/ci.yml', 'push')],
       ['101', run('101', '.github/workflows/desktop-admission.yml', 'workflow_dispatch')],
@@ -433,7 +426,6 @@ class FakeGithub {
 
   async getRepository() { return structuredClone(this.repository) }
   async getBranchHead() { return this.source }
-  async getBranchProtection() { return this.protection }
   async getRun(id) { return structuredClone(this.runs.get(String(id))) }
   async getRunJobs(id) { return structuredClone(this.jobs.get(String(id))) }
   async getArtifact(id) { return structuredClone(this.artifacts.get(String(id)).metadata) }

@@ -73,7 +73,7 @@ describe('external performance admission owner', () => {
 
   it('fails closed for provenance, extra files, verifier drift, fixture gates, or install drift', async t => {
     const cases = [
-      ['unprotected main', fixture => { fixture.github.protection.enforceAdmins = false }],
+      ['unprotected main', fixture => { fixture.config.refProtected = false }],
       ['private repository', fixture => { fixture.github.repository.visibility = 'private' }],
       ['rerun CI', fixture => { fixture.github.runs.get('100').runAttempt = 2 }],
       ['rerun Desktop build', fixture => { fixture.github.runs.get('102').runAttempt = 2 }],
@@ -393,13 +393,6 @@ class FakeGithub {
       archived: false,
       disabled: false,
     }
-    this.protection = {
-      requiredStatusChecks: { strict: true, contexts: ['CI admission'] },
-      enforceAdmins: true,
-      requiredLinearHistory: true,
-      allowForcePushes: false,
-      allowDeletions: false,
-    }
     this.runs = new Map([
       ['100', run('100', '.github/workflows/ci.yml', 'push')],
       ['102', run('102', '.github/workflows/desktop-release.yml', 'workflow_dispatch')],
@@ -427,7 +420,6 @@ class FakeGithub {
 
   async getRepository() { return structuredClone(this.repository) }
   async getBranchHead() { return SOURCE }
-  async getBranchProtection() { return structuredClone(this.protection) }
   async getRun(id) { return structuredClone(this.runs.get(String(id))) }
   async getRunJobs(id) { return structuredClone(this.jobs.get(String(id))) }
   async getArtifact(id) { return structuredClone(this.artifacts.get(String(id)).metadata) }
