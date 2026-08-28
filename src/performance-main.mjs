@@ -32,7 +32,8 @@ async function main() {
       githubSha: requiredEnv('GITHUB_SHA'),
       sourceCommit: requiredEnv('EMATE_SOURCE_SHA'),
       mainCiRunId: requiredEnv('EMATE_MAIN_CI_RUN_ID'),
-      macosSignerRunId: requiredEnv('EMATE_MACOS_SIGNER_RUN_ID'),
+      macosPublicationMode: requiredEnv('EMATE_MACOS_PUBLICATION_MODE'),
+      macosSignerRunId: optionalEnv('EMATE_MACOS_SIGNER_RUN_ID'),
       currentRunId: requiredEnv('GITHUB_RUN_ID'),
       currentRunAttempt: requiredEnv('GITHUB_RUN_ATTEMPT'),
       desktopArtifactId: requiredEnv('EMATE_DESKTOP_ARTIFACT_ID'),
@@ -142,6 +143,10 @@ function requiredEnv(name) {
   const value = process.env[name]
   if (value === undefined || value === '') throw new Error(`required performance admission binding ${name} is missing`)
   return value
+}
+
+function optionalEnv(name) {
+  return process.env[name] || undefined
 }
 
 async function setOutput(name, value) {

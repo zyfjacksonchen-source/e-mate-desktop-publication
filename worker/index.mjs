@@ -11,6 +11,8 @@ const MAX_AUTH_WINDOW_MS = 15 * 60 * 1000
 const MAX_TRANSFER_MS = 10 * 60 * 1000
 const IMMUTABLE_CACHE = 'public,max-age=31536000,immutable'
 const BINARY_CONTENT_TYPE = 'application/octet-stream'
+const DESKTOP_CI_RECEIPT = 'desktop-artifact-receipt.json'
+const DESKTOP_RUNTIME_RECEIPT = 'desktop-runtime-verification.json'
 const MACOS_SIGNED_RECEIPT = 'desktop-macos-signed-receipt.json'
 const MACOS_SIGNED_VERIFICATION = 'desktop-macos-signed-verification.json'
 const TOKEN = /^[A-Za-z0-9_-]{43}$/u
@@ -83,6 +85,9 @@ async function ingest(request, env, dependencies) {
       config.archiveEntries,
       controller.signal,
     )
+    if (archive.archiveBytes !== config.githubArtifactBytes) {
+      throw new BridgeError(422, 'archive-shape-invalid')
+    }
     const response = await dependencies.fetch(sourceUrl, {
       method: 'GET',
       redirect: 'error',
@@ -154,16 +159,29 @@ function validateConfig(env, now) {
   }
   const match = RELEASE_KEY.exec(env.EXPECTED_KEY ?? '')
   const bytes = Number(env.EXPECTED_BYTES)
+  const githubArtifactBytes = Number(env.EXPECTED_GITHUB_ARTIFACT_BYTES)
   const expiresAt = Number(env.EXPIRES_AT)
   const sourceOrigin = strictSourceOrigin(env.EXPECTED_SOURCE_ORIGIN)
-  const archiveEntries = expectedArchiveEntries(env.EXPECTED_ARCHIVE_ENTRIES, env.EXPECTED_ARTIFACT_PATH, bytes)
+  const publicationMetadata = expectedPublicationMetadata(
+    env.EXPECTED_PUBLICATION_METADATA,
+    env.EXPECTED_ARTIFACT_PATH,
+  )
+  const archiveEntries = expectedArchiveEntries(
+    env.EXPECTED_ARCHIVE_ENTRIES,
+    env.EXPECTED_ARTIFACT_PATH,
+    bytes,
+    publicationMetadata,
+  )
   if (match === null || env.EXPECTED_ARTIFACT_PATH !== match[2]
     || !Number.isSafeInteger(bytes) || bytes <= 0 || bytes > MAX_OBJECT_BYTES
+    || !Number.isSafeInteger(githubArtifactBytes) || githubArtifactBytes <= bytes
+    || githubArtifactBytes > MAX_OBJECT_BYTES + MAX_ARCHIVE_OVERHEAD
     || !SHA256.test(env.EXPECTED_SHA256 ?? '')
     || !ARTIFACT_DIGEST.test(env.EXPECTED_GITHUB_ARTIFACT_DIGEST ?? '')
     || !SHA256.test(env.EXPECTED_PLAN_SHA256 ?? '')
     || env.EXPECTED_CONTENT_TYPE !== BINARY_CONTENT_TYPE
     || env.EXPECTED_CACHE_CONTROL !== IMMUTABLE_CACHE
+    || publicationMetadata === null
     || archiveEntries === null
     || !TOKEN.test(env.AUTH_TOKEN ?? '')
     || !Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt - now > MAX_AUTH_WINDOW_MS
@@ -182,8 +200,10 @@ function validateConfig(env, now) {
     contentType: env.EXPECTED_CONTENT_TYPE,
     expiresAt,
     githubArtifactSha256: ARTIFACT_DIGEST.exec(env.EXPECTED_GITHUB_ARTIFACT_DIGEST)[1],
+    githubArtifactBytes,
     key: env.EXPECTED_KEY,
     planSha256: env.EXPECTED_PLAN_SHA256,
+    publicationMetadata,
     sha256: env.EXPECTED_SHA256,
     sourceOrigin,
     sourcePath: env.EXPECTED_SOURCE_PATH,
@@ -202,7 +222,23 @@ function strictSourceOrigin(value) {
   }
 }
 
-function expectedArchiveEntries(value, artifactPath, installerBytes) {
+function expectedPublicationMetadata(value, artifactPath) {
+  let metadata
+  try {
+    if (typeof value !== 'string' || value.length > 512) return null
+    metadata = JSON.parse(value)
+  } catch {
+    return null
+  }
+  if (!hasExactKeys(metadata, ['mode', 'signed', 'notarized', 'description'])) return null
+  const macos = typeof artifactPath === 'string' && artifactPath.endsWith('-mac-universal.dmg')
+  const expected = macos && metadata.mode === 'signed'
+    ? { mode: 'signed', signed: true, notarized: true, description: 'Developer ID signed and notarized.' }
+    : { mode: 'unsigned', signed: false, notarized: false, description: 'Unsigned and not notarized.' }
+  return Object.keys(expected).every(key => metadata[key] === expected[key]) ? metadata : null
+}
+
+function expectedArchiveEntries(value, artifactPath, installerBytes, publicationMetadata) {
   let entries
   try {
     if (typeof value !== 'string' || value.length > 2048) return null
@@ -210,14 +246,14 @@ function expectedArchiveEntries(value, artifactPath, installerBytes) {
   } catch {
     return null
   }
-  const signedMac = typeof artifactPath === 'string' && artifactPath.endsWith('-mac-universal.dmg')
-  if (!Array.isArray(entries) || (signedMac ? entries.length !== 4 : ![3, 4].includes(entries.length))) return null
+  const macos = typeof artifactPath === 'string' && artifactPath.endsWith('-mac-universal.dmg')
+  if (!Array.isArray(entries) || publicationMetadata === null) return null
   const names = entries.map(entry => entry?.name)
-  const allowed = signedMac
+  const expected = macos && publicationMetadata.mode === 'signed'
     ? [MACOS_SIGNED_RECEIPT, MACOS_SIGNED_VERIFICATION, artifactPath, `${artifactPath}.blockmap`]
-    : ['desktop-artifact-receipt.json', 'desktop-runtime-verification.json', artifactPath]
-  if (!signedMac && entries.length === 4) allowed.push(`${artifactPath}.blockmap`)
-  if (JSON.stringify(names) !== JSON.stringify([...allowed].sort())) return null
+    : [DESKTOP_CI_RECEIPT, DESKTOP_RUNTIME_RECEIPT, artifactPath,
+        ...(macos ? [`${artifactPath}.blockmap`] : [])]
+  if (JSON.stringify(names) !== JSON.stringify(expected.sort())) return null
   if (new Set(names).size !== names.length || entries.some(entry => !hasExactKeys(entry, ['name', 'bytes'])
     || !safeArchiveName(entry.name) || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0)) return null
   for (const entry of entries) {
@@ -519,10 +555,18 @@ async function verifyObject(bucket, key, config) {
   if (object === null || !(object.body instanceof ReadableStream) || object.size !== config.bytes
     || object.httpMetadata?.contentType !== config.contentType
     || object.httpMetadata?.cacheControl !== config.cacheControl
-    || !hasExactKeys(custom, ['sha256', 'bytes', 'plan_sha256', 'github_artifact_digest'])
+    || !hasExactKeys(custom, [
+      'sha256', 'bytes', 'plan_sha256', 'github_artifact_digest', 'github_artifact_bytes',
+      'publication_mode', 'signed', 'notarized', 'description',
+    ])
     || custom.sha256 !== config.sha256 || custom.bytes !== String(config.bytes)
     || custom.plan_sha256 !== config.planSha256
-    || custom.github_artifact_digest !== `sha256:${config.githubArtifactSha256}`) {
+    || custom.github_artifact_digest !== `sha256:${config.githubArtifactSha256}`
+    || custom.github_artifact_bytes !== String(config.githubArtifactBytes)
+    || custom.publication_mode !== config.publicationMetadata.mode
+    || custom.signed !== String(config.publicationMetadata.signed)
+    || custom.notarized !== String(config.publicationMetadata.notarized)
+    || custom.description !== config.publicationMetadata.description) {
     throw new BridgeError(409, 'object-readback-mismatch')
   }
   const digest = createHash('sha256')
@@ -550,6 +594,11 @@ function objectMetadata(config) {
       bytes: String(config.bytes),
       plan_sha256: config.planSha256,
       github_artifact_digest: `sha256:${config.githubArtifactSha256}`,
+      github_artifact_bytes: String(config.githubArtifactBytes),
+      publication_mode: config.publicationMetadata.mode,
+      signed: String(config.publicationMetadata.signed),
+      notarized: String(config.publicationMetadata.notarized),
+      description: config.publicationMetadata.description,
     },
   }
 }
