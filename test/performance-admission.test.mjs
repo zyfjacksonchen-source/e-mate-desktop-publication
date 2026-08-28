@@ -71,6 +71,12 @@ describe('external performance admission owner', () => {
     ), true)
   })
 
+  it('accepts explicit unsigned macOS ownership by the trusted formal CI run', async () => {
+    const fixture = performanceFixture({ macosPublicationMode: 'unsigned' })
+    const result = await fixture.admit()
+    assert.equal(result.performanceRunId, fixture.evidence.performance_run_id)
+  })
+
   it('fails closed for provenance, extra files, verifier drift, fixture gates, or install drift', async t => {
     const cases = [
       ['unprotected main', fixture => { fixture.config.refProtected = false }],
@@ -141,6 +147,29 @@ describe('external performance admission owner', () => {
     for (const [name, mutate] of cases) {
       await t.test(name, async () => {
         const fixture = performanceFixture()
+        mutate(fixture)
+        await assert.rejects(fixture.admit())
+      })
+    }
+  })
+
+  it('rejects performance macOS publication mode confusion', async t => {
+    const cases = [
+      ['unknown mode', fixture => { fixture.config.macosPublicationMode = 'automatic' }],
+      ['unsigned with signer run', fixture => { fixture.config.macosSignerRunId = '105' }],
+      ['signed without signer run', fixture => { fixture.config.macosSignerRunId = undefined }],
+      ['unsigned candidate owned by signer', fixture => {
+        const candidate = JSON.parse(fixture.github.file('202', 'desktop-candidate.json').buffer)
+        candidate.artifacts.darwin.build_run_id = '105'
+        fixture.github.replaceFile('202', 'desktop-candidate.json', pretty(candidate))
+      }],
+      ['unsigned with signed Desktop release job', fixture => {
+        fixture.github.jobs.set('102', [job('Bind exact signed macOS and protected-main CI Windows bytes')])
+      }],
+    ]
+    for (const [name, mutate] of cases) {
+      await t.test(name, async () => {
+        const fixture = performanceFixture({ macosPublicationMode: name.startsWith('signed') ? 'signed' : 'unsigned' })
         mutate(fixture)
         await assert.rejects(fixture.admit())
       })
@@ -229,6 +258,7 @@ describe('external performance admission owner', () => {
     const action = await readFile(new URL('../performance/action.yml', import.meta.url), 'utf8')
     const main = await readFile(new URL('../src/performance-main.mjs', import.meta.url), 'utf8')
     assert.match(action, /desktop-artifact-id:/u)
+    assert.match(action, /macos-publication-mode:/u)
     assert.match(action, /macos-signer-run-id:/u)
     assert.match(action, /profile-release-run-id:/u)
     assert.match(action, /profile-artifact-id:/u)
@@ -244,7 +274,8 @@ describe('external performance admission owner', () => {
   })
 })
 
-function performanceFixture() {
+function performanceFixture(options = {}) {
+  const macosPublicationMode = options.macosPublicationMode ?? 'signed'
   const keyPair = generateKeyPairSync('ed25519')
   const privateKeyPem = keyPair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString()
   const mac = Buffer.from('exact-mac-installer')
@@ -257,7 +288,7 @@ function performanceFixture() {
     source_commit: SOURCE,
     schedule_protocol_floor: 1,
     artifacts: {
-      darwin: artifactRecord('darwin', mac),
+      darwin: artifactRecord('darwin', mac, macosPublicationMode === 'signed' ? '105' : '100'),
       win32: artifactRecord('win32', win),
     },
   }
@@ -326,6 +357,9 @@ function performanceFixture() {
       [PERFORMANCE_VERIFIER_SOURCE, verifierBytes],
     ]),
   })
+  if (macosPublicationMode === 'unsigned') {
+    github.jobs.set('102', [job('Bind exact protected-main CI unsigned desktop bytes')])
+  }
   const config = {
     repository: EXPECTED_REPOSITORY,
     actionRepository: EXPECTED_ACTION_REPOSITORY,
@@ -336,7 +370,8 @@ function performanceFixture() {
     githubSha: SOURCE,
     sourceCommit: SOURCE,
     mainCiRunId: '100',
-    macosSignerRunId: '105',
+    macosPublicationMode,
+    macosSignerRunId: macosPublicationMode === 'signed' ? '105' : undefined,
     currentRunId: '103',
     currentRunAttempt: '1',
     desktopArtifactId: '202',
@@ -506,7 +541,7 @@ function supportingPaths(evidence) {
     .map(([, value]) => value.path))
 }
 
-function artifactRecord(platform, bytes) {
+function artifactRecord(platform, bytes, buildRunId = platform === 'darwin' ? '105' : '100') {
   const name = platform === 'darwin'
     ? 'e-Mate-2.0.15-mac-universal.dmg'
     : 'e-Mate-2.0.15-win-x64-Setup.exe'
@@ -515,7 +550,7 @@ function artifactRecord(platform, bytes) {
     bytes: bytes.byteLength,
     sha256: sha256(bytes),
     build_source_commit: SOURCE,
-    build_run_id: platform === 'darwin' ? '105' : '100',
+    build_run_id: buildRunId,
   }
 }
 

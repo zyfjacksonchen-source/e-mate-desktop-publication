@@ -4,11 +4,11 @@ This module is a publication helper for the connected Codex Cloudflare plugin.
 It is not part of either composite action and is never deployed by GitHub,
 Wrangler, a repository secret, or a local release command.
 
-It closes one existing handoff seam: the signed macOS artifact contains exactly
-the final DMG, blockmap, signed receipt, and verification receipt, while the
-formal-CI Windows artifact keeps its installer, two receipts, and optional
-blockmap. Both are closed ZIP `Stored` entry sets, and the control-plane object
-PUT is too small for the macOS DMG.
+It closes one existing handoff seam: signed macOS mode contains exactly the
+final DMG, blockmap, signed receipt, and verification receipt; unsigned macOS
+mode and Windows contain the exact formal-CI installer, two receipts, and
+optional blockmap. These explicit contracts are closed ZIP `Stored` entry sets,
+and the control-plane object PUT is too small for the macOS DMG.
 The Worker range-checks the bounded central directory against the plan's exact
 entry names/byte counts, streams the full archive once, verifies both the GitHub
 artifact archive SHA-256 and the embedded installer byte count/SHA-256, completes

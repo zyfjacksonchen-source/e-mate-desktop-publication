@@ -11,6 +11,8 @@ const MAX_AUTH_WINDOW_MS = 15 * 60 * 1000
 const MAX_TRANSFER_MS = 10 * 60 * 1000
 const IMMUTABLE_CACHE = 'public,max-age=31536000,immutable'
 const BINARY_CONTENT_TYPE = 'application/octet-stream'
+const DESKTOP_CI_RECEIPT = 'desktop-artifact-receipt.json'
+const DESKTOP_RUNTIME_RECEIPT = 'desktop-runtime-verification.json'
 const MACOS_SIGNED_RECEIPT = 'desktop-macos-signed-receipt.json'
 const MACOS_SIGNED_VERIFICATION = 'desktop-macos-signed-verification.json'
 const TOKEN = /^[A-Za-z0-9_-]{43}$/u
@@ -210,14 +212,14 @@ function expectedArchiveEntries(value, artifactPath, installerBytes) {
   } catch {
     return null
   }
-  const signedMac = typeof artifactPath === 'string' && artifactPath.endsWith('-mac-universal.dmg')
-  if (!Array.isArray(entries) || (signedMac ? entries.length !== 4 : ![3, 4].includes(entries.length))) return null
+  const macos = typeof artifactPath === 'string' && artifactPath.endsWith('-mac-universal.dmg')
+  if (!Array.isArray(entries) || ![3, 4].includes(entries.length)) return null
   const names = entries.map(entry => entry?.name)
-  const allowed = signedMac
-    ? [MACOS_SIGNED_RECEIPT, MACOS_SIGNED_VERIFICATION, artifactPath, `${artifactPath}.blockmap`]
-    : ['desktop-artifact-receipt.json', 'desktop-runtime-verification.json', artifactPath]
-  if (!signedMac && entries.length === 4) allowed.push(`${artifactPath}.blockmap`)
-  if (JSON.stringify(names) !== JSON.stringify([...allowed].sort())) return null
+  const ci = [DESKTOP_CI_RECEIPT, DESKTOP_RUNTIME_RECEIPT, artifactPath]
+  const allowed = macos
+    ? [ci, [...ci, `${artifactPath}.blockmap`], [MACOS_SIGNED_RECEIPT, MACOS_SIGNED_VERIFICATION, artifactPath, `${artifactPath}.blockmap`]]
+    : [ci, [...ci, `${artifactPath}.blockmap`]]
+  if (!allowed.some(set => JSON.stringify(names) === JSON.stringify([...set].sort()))) return null
   if (new Set(names).size !== names.length || entries.some(entry => !hasExactKeys(entry, ['name', 'bytes'])
     || !safeArchiveName(entry.name) || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0)) return null
   for (const entry of entries) {

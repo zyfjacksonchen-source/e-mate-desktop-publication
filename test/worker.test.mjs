@@ -68,6 +68,19 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
     assert.deepEqual(fixture.bucket.bytes(fixture.env.EXPECTED_KEY), fixture.file)
   })
 
+  it('accepts the exact formal-CI unsigned macOS archive closure', async () => {
+    const fixture = makeFixture({ token: 'E'.repeat(43), unsignedMac: true })
+    const response = await fixture.call()
+    assert.equal(response.status, 200)
+    assert.equal((await response.json()).status, 'uploaded')
+    assert.deepEqual(fixture.bucket.bytes(fixture.env.EXPECTED_KEY), fixture.file)
+    assert.deepEqual(JSON.parse(fixture.env.EXPECTED_ARCHIVE_ENTRIES).map(entry => entry.name), [
+      'desktop-artifact-receipt.json',
+      'desktop-runtime-verification.json',
+      ARTIFACT,
+    ])
+  })
+
   it('fails before the first write for auth, source, plan, pointer, or size drift', async t => {
     const cases = [
       ['wrong bearer', fixture => fixture.request({ token: 'Z'.repeat(43) }), 401, 'unauthorized'],
@@ -85,10 +98,10 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
         fixture.env.EXPECTED_ARCHIVE_ENTRIES = '[]'
         return fixture.request()
       }, 503, 'configuration-invalid'],
-      ['unsigned macOS CI closure cannot be a final darwin source', fixture => {
+      ['mixed macOS signed and unsigned closure', fixture => {
         fixture.env.EXPECTED_ARCHIVE_ENTRIES = JSON.stringify([
           { name: 'desktop-artifact-receipt.json', bytes: 1 },
-          { name: 'desktop-runtime-verification.json', bytes: 1 },
+          { name: 'desktop-macos-signed-verification.json', bytes: 1 },
           { name: ARTIFACT, bytes: fixture.file.byteLength },
         ].sort((left, right) => left.name.localeCompare(right.name)))
         return fixture.request()
@@ -235,7 +248,7 @@ function makeFixture(options = {}) {
   const artifact = options.windows ? 'e-Mate-2.0.15-win-x64-Setup.exe' : ARTIFACT
   const key = `desktop/releases/v2.0.15/${SOURCE}/${artifact}`
   const file = new TextEncoder().encode('exact installer bytes for a streaming fixture')
-  const archiveEntries = options.windows
+  const archiveEntries = options.windows || options.unsignedMac
     ? [
         { name: artifact, data: file },
         { name: 'desktop-runtime-verification.json', data: new TextEncoder().encode('{"runtime":true}\n') },
