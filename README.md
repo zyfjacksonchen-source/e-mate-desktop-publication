@@ -106,13 +106,13 @@ cloudflare-publication-plan.json
 cloudflare-plugin-handoff.json
 ```
 
-`desktop-release-signed.json` is schema v4: it preserves the admitted schema-v2
-release fields, adds one exact `publication_metadata` object, and adds one
-domain-separated Ed25519 signature. Its signing context is
-`e-mate-desktop-release-manifest-v4\0`, and the private key must derive exactly
-the public key already present in the admitted Base. Unsigned mode records both
-platforms as `mode=unsigned`, `signed=false`, and `notarized=false`; it never
-contains Developer ID or notary acceptance claims.
+`desktop-release-signed.json` keeps the updater-compatible admitted schema-v2
+manifest unchanged: the exact ten release fields plus one domain-separated
+Ed25519 `signature`. Its signing context remains
+`e-mate-desktop-release-manifest-v2\0`, and the private key must derive exactly
+the public key already present in the admitted Base. The filename's `signed`
+means manifest-metadata signing; it does not claim that either installer is
+platform-signed.
 
 `cloudflare-publication-plan.json` has a closed schema. It records:
 
@@ -126,9 +126,10 @@ contains Developer ID or notary acceptance claims.
 
 The manual immutable manifest and both active pointers reference the same
 `desktop-release-signed.json` bytes and SHA-256. The signed bytes are also
-bounded by the 2.0.12 reader's 16 KiB limit. A caller pinning this action must
-admit schema v4 and display its exact publication description/security state;
-schema v2/v3 exact-key readers must be updated before this action is dispatched.
+bounded by the 2.0.12 reader's 16 KiB limit. Installer security truth is not
+added to the updater manifest: it remains in the publication plan, handoff,
+each immutable object's `publication_metadata`, and the Worker's exact R2
+custom metadata for the release-state and download-page projection.
 
 `cloudflare-plugin-handoff.json` binds the manifest and plan hashes to the exact
 action commit and GitHub provenance. It explicitly records that no production

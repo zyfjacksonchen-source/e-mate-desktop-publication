@@ -53,20 +53,41 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     const signed = JSON.parse(signedBytes)
     const { signature, ...unsigned } = signed
     assert.equal(signature.key_id, KEY_ID)
-    assert.equal(unsigned.schema_version, 4)
-    assert.deepEqual(unsigned.publication_metadata, {
-      description: 'e-Mate 2.0.15 publishes a Developer ID signed and notarized macOS installer and an unsigned Windows installer.',
-      platforms: {
-        darwin: { mode: 'signed', signed: true, notarized: true, description: 'Developer ID signed and notarized.' },
-        win32: { mode: 'unsigned', signed: false, notarized: false, description: 'Unsigned and not notarized.' },
-      },
-    })
+    assert.deepEqual(Object.keys(signature), ['algorithm', 'key_id', 'value'])
+    assert.equal(unsigned.schema_version, 2)
+    assert.deepEqual(Object.keys(unsigned), [
+      'schema_version', 'document_type', 'release_status', 'version', 'source_commit',
+      'base_contract_id', 'schedule_protocol_floor', 'profile_component_aggregate',
+      'github_artifact_provenance', 'artifacts',
+    ])
+    assert.deepEqual(Object.keys(signed), [...Object.keys(unsigned), 'signature'])
+    assert.equal('publication_metadata' in signed, false)
     assert.equal(verify(
       null,
       Buffer.concat([RELEASE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(unsigned), 'utf8')]),
       fixture.keyPair.publicKey,
       Buffer.from(signature.value, 'base64'),
     ), true)
+    for (const incompatible of [
+      { ...unsigned, schema_version: 4 },
+      { ...unsigned, publication_metadata: { mode: 'unsigned' } },
+    ]) {
+      assert.equal(verify(
+        null,
+        Buffer.concat([RELEASE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(incompatible), 'utf8')]),
+        fixture.keyPair.publicKey,
+        Buffer.from(signature.value, 'base64'),
+      ), false)
+    }
+    assert.equal(verify(
+      null,
+      Buffer.concat([
+        Buffer.from('e-mate-desktop-release-manifest-v4\0', 'utf8'),
+        Buffer.from(canonicalJson(unsigned), 'utf8'),
+      ]),
+      fixture.keyPair.publicKey,
+      Buffer.from(signature.value, 'base64'),
+    ), false)
 
     const planBytes = await result.files.get(PUBLICATION_PLAN_FILENAME).read()
     const plan = JSON.parse(planBytes)
@@ -162,8 +183,8 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     const result = await fixture.prepare()
     const manifest = JSON.parse(await result.files.get(SIGNED_MANIFEST_FILENAME).read())
     const plan = JSON.parse(await result.files.get(PUBLICATION_PLAN_FILENAME).read())
-    assert.equal(manifest.schema_version, 4)
-    assert.deepEqual(manifest.publication_metadata, plan.publication_metadata)
+    assert.equal(manifest.schema_version, 2)
+    assert.equal('publication_metadata' in manifest, false)
     assert.deepEqual(plan.github, {
       main_ci_run_id: '100',
       macos_publication_mode: 'unsigned',

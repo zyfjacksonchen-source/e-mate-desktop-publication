@@ -11,7 +11,7 @@ export const EXPECTED_ACTION_REPOSITORY = 'zyfjacksonchen-source/e-mate-desktop-
 export const PUBLIC_ORIGIN = 'https://pub-ada3f610c0234a76838f4e19fe2bb25e.r2.dev'
 export const EXPECTED_R2_BUCKET = 'emate-desktop-downloads'
 export const RELEASE_VERSION = '2.0.15'
-export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-manifest-v4\0', 'utf8')
+export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-manifest-v2\0', 'utf8')
 export const PERFORMANCE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-admission-v1\0', 'utf8')
 export const PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-aggregate-admission-v1\0', 'utf8')
 export const PERFORMANCE_EVIDENCE_FILENAME = 'e-mate-performance-evidence.json'
@@ -481,19 +481,13 @@ export async function prepareDesktopPublication(config, dependencies) {
       win32: UNSIGNED_PLATFORM_METADATA,
     },
   }
-  const releaseManifest = {
-    ...unsigned,
-    schema_version: 4,
-    publication_metadata: publicationMetadata,
-  }
-
   const signatureValue = sign(
     null,
-    Buffer.concat([RELEASE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(releaseManifest), 'utf8')]),
+    Buffer.concat([RELEASE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(unsigned), 'utf8')]),
     signing.privateKey,
   ).toString('base64')
   const signedManifest = {
-    ...releaseManifest,
+    ...unsigned,
     signature: {
       algorithm: 'ed25519',
       key_id: config.signingKeyId,
