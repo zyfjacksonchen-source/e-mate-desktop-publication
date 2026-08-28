@@ -49,9 +49,11 @@ async function main() {
       githubSha: requiredEnv('GITHUB_SHA'),
       sourceCommit: requiredEnv('EMATE_SOURCE_SHA'),
       mainCiRunId: requiredEnv('EMATE_MAIN_CI_RUN_ID'),
-      macosSignerRunId: requiredEnv('EMATE_MACOS_SIGNER_RUN_ID'),
+      macosPublicationMode: requiredEnv('EMATE_MACOS_PUBLICATION_MODE'),
+      macosSignerRunId: optionalEnv('EMATE_MACOS_SIGNER_RUN_ID'),
       admissionArtifactId: requiredEnv('EMATE_ADMISSION_ARTIFACT_ID'),
-      macosSignedArtifactId: requiredEnv('EMATE_MACOS_SIGNED_ARTIFACT_ID'),
+      macosSignedArtifactId: optionalEnv('EMATE_MACOS_SIGNED_ARTIFACT_ID'),
+      macosUnsignedArtifactId: optionalEnv('EMATE_MACOS_UNSIGNED_ARTIFACT_ID'),
       windowsArtifactId: requiredEnv('EMATE_WINDOWS_STAGING_ARTIFACT_ID'),
       expectedSignedCurrent: parseExpectedCurrent(requiredEnv('EMATE_EXPECTED_SIGNED_CURRENT')),
       expectedLegacyCurrent: parseExpectedCurrent(requiredEnv('EMATE_EXPECTED_LEGACY_CURRENT')),
@@ -191,6 +193,7 @@ export class GithubClient {
     const files = await extractArchiveFiles(archive, extracted, entries)
     return {
       archiveSha256: await digestFile(archive),
+      archiveBytes: (await lstat(archive)).size,
       files,
       storedEntries: () => storedArchiveEntries(archive, entries),
     }
@@ -390,6 +393,10 @@ function requiredEnv(name) {
   const value = process.env[name]
   if (value === undefined || value === '') throw new Error(`required publication binding ${name} is missing`)
   return value
+}
+
+function optionalEnv(name) {
+  return process.env[name] || undefined
 }
 
 async function setOutput(name, value) {

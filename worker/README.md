@@ -4,11 +4,12 @@ This module is a publication helper for the connected Codex Cloudflare plugin.
 It is not part of either composite action and is never deployed by GitHub,
 Wrangler, a repository secret, or a local release command.
 
-It closes one existing handoff seam: the signed macOS artifact contains exactly
-the final DMG, blockmap, signed receipt, and verification receipt, while the
-formal-CI Windows artifact keeps its installer, two receipts, and optional
-blockmap. Both are closed ZIP `Stored` entry sets, and the control-plane object
-PUT is too small for the macOS DMG.
+It closes one existing handoff seam: signed macOS mode contains exactly the
+final DMG, blockmap, signed receipt, and verification receipt; unsigned macOS
+contains the exact formal-CI DMG, blockmap, and two CI receipts; Windows
+contains the exact formal-CI installer and two CI receipts. These explicit
+contracts are closed ZIP `Stored` entry sets,
+and the control-plane object PUT is too small for the macOS DMG.
 The Worker range-checks the bounded central directory against the plan's exact
 entry names/byte counts, streams the full archive once, verifies both the GitHub
 artifact archive SHA-256 and the embedded installer byte count/SHA-256, completes
@@ -35,8 +36,9 @@ For each installer object independently, the connected plugin must:
    per-object variables from the reviewed plan and redirect:
 
    - `EXPECTED_BUCKET`, `EXPECTED_KEY`, `EXPECTED_ARTIFACT_PATH`
-   - `EXPECTED_BYTES`, `EXPECTED_SHA256`, `EXPECTED_GITHUB_ARTIFACT_DIGEST`
+   - `EXPECTED_BYTES`, `EXPECTED_SHA256`, `EXPECTED_GITHUB_ARTIFACT_DIGEST`, `EXPECTED_GITHUB_ARTIFACT_BYTES`
    - `EXPECTED_ARCHIVE_ENTRIES` as the exact plan array JSON
+   - `EXPECTED_PUBLICATION_METADATA` as the exact installer `publication_metadata` JSON
    - `EXPECTED_PLAN_SHA256`, `EXPECTED_CONTENT_TYPE`, `EXPECTED_CACHE_CONTROL`
    - `EXPECTED_SOURCE_ORIGIN`, `EXPECTED_SOURCE_PATH`, `EXPIRES_AT`
    - one freshly generated 32-byte base64url secret `AUTH_TOKEN`

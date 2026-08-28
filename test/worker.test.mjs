@@ -68,6 +68,20 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
     assert.deepEqual(fixture.bucket.bytes(fixture.env.EXPECTED_KEY), fixture.file)
   })
 
+  it('accepts the exact formal-CI unsigned macOS archive closure', async () => {
+    const fixture = makeFixture({ token: 'E'.repeat(43), unsignedMac: true })
+    const response = await fixture.call()
+    assert.equal(response.status, 200)
+    assert.equal((await response.json()).status, 'uploaded')
+    assert.deepEqual(fixture.bucket.bytes(fixture.env.EXPECTED_KEY), fixture.file)
+    assert.deepEqual(JSON.parse(fixture.env.EXPECTED_ARCHIVE_ENTRIES).map(entry => entry.name), [
+      'desktop-artifact-receipt.json',
+      'desktop-runtime-verification.json',
+      ARTIFACT,
+      `${ARTIFACT}.blockmap`,
+    ])
+  })
+
   it('fails before the first write for auth, source, plan, pointer, or size drift', async t => {
     const cases = [
       ['wrong bearer', fixture => fixture.request({ token: 'Z'.repeat(43) }), 401, 'unauthorized'],
@@ -85,10 +99,26 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
         fixture.env.EXPECTED_ARCHIVE_ENTRIES = '[]'
         return fixture.request()
       }, 503, 'configuration-invalid'],
-      ['unsigned macOS CI closure cannot be a final darwin source', fixture => {
+      ['missing publication metadata', fixture => {
+        delete fixture.env.EXPECTED_PUBLICATION_METADATA
+        return fixture.request()
+      }, 503, 'configuration-invalid'],
+      ['unsigned metadata with signed archive', fixture => {
+        fixture.env.EXPECTED_PUBLICATION_METADATA = JSON.stringify({
+          mode: 'unsigned', signed: false, notarized: false, description: 'Unsigned and not notarized.',
+        })
+        return fixture.request()
+      }, 503, 'configuration-invalid'],
+      ['unsigned metadata claims notarized', fixture => {
+        fixture.env.EXPECTED_PUBLICATION_METADATA = JSON.stringify({
+          mode: 'unsigned', signed: false, notarized: true, description: 'Unsigned and not notarized.',
+        })
+        return fixture.request()
+      }, 503, 'configuration-invalid'],
+      ['mixed macOS signed and unsigned closure', fixture => {
         fixture.env.EXPECTED_ARCHIVE_ENTRIES = JSON.stringify([
           { name: 'desktop-artifact-receipt.json', bytes: 1 },
-          { name: 'desktop-runtime-verification.json', bytes: 1 },
+          { name: 'desktop-macos-signed-verification.json', bytes: 1 },
           { name: ARTIFACT, bytes: fixture.file.byteLength },
         ].sort((left, right) => left.name.localeCompare(right.name)))
         return fixture.request()
@@ -115,6 +145,9 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
       ['installer digest drift', fixture => {
         fixture.env.EXPECTED_SHA256 = 'e'.repeat(64)
       }, 422, 'source-digest-mismatch'],
+      ['GitHub archive bytes drift', fixture => {
+        fixture.env.EXPECTED_GITHUB_ARTIFACT_BYTES = String(Number(fixture.env.EXPECTED_GITHUB_ARTIFACT_BYTES) + 1)
+      }, 422, 'archive-shape-invalid'],
       ['compressed entry', fixture => {
         fixture.replaceArchive(storedZipEntries(fixture.archiveEntries.map(entry => ({
           ...entry,
@@ -241,6 +274,13 @@ function makeFixture(options = {}) {
         { name: 'desktop-runtime-verification.json', data: new TextEncoder().encode('{"runtime":true}\n') },
         { name: 'desktop-artifact-receipt.json', data: new TextEncoder().encode('{"receipt":true}\n') },
       ]
+    : options.unsignedMac
+      ? [
+          { name: artifact, data: file },
+          { name: `${artifact}.blockmap`, data: new TextEncoder().encode('exact unsigned blockmap') },
+          { name: 'desktop-runtime-verification.json', data: new TextEncoder().encode('{"runtime":true}\n') },
+          { name: 'desktop-artifact-receipt.json', data: new TextEncoder().encode('{"receipt":true}\n') },
+        ]
     : [
         { name: artifact, data: file },
         { name: `${artifact}.blockmap`, data: new TextEncoder().encode('exact blockmap') },
@@ -259,7 +299,11 @@ function makeFixture(options = {}) {
     EXPECTED_BYTES: String(file.byteLength),
     EXPECTED_SHA256: sha256(file),
     EXPECTED_GITHUB_ARTIFACT_DIGEST: `sha256:${sha256(archive)}`,
+    EXPECTED_GITHUB_ARTIFACT_BYTES: String(archive.byteLength),
     EXPECTED_ARCHIVE_ENTRIES: JSON.stringify(archiveContract(archiveEntries)),
+    EXPECTED_PUBLICATION_METADATA: JSON.stringify(options.windows || options.unsignedMac
+      ? { mode: 'unsigned', signed: false, notarized: false, description: 'Unsigned and not notarized.' }
+      : { mode: 'signed', signed: true, notarized: true, description: 'Developer ID signed and notarized.' }),
     EXPECTED_PLAN_SHA256: PLAN,
     EXPECTED_CONTENT_TYPE: 'application/octet-stream',
     EXPECTED_CACHE_CONTROL: 'public,max-age=31536000,immutable',
@@ -278,6 +322,7 @@ function makeFixture(options = {}) {
       archive = next
       source = artifactSource(archive)
       env.EXPECTED_GITHUB_ARTIFACT_DIGEST = `sha256:${sha256(archive)}`
+      env.EXPECTED_GITHUB_ARTIFACT_BYTES = String(archive.byteLength)
     },
     request(overrides = {}) {
       const body = {
@@ -513,6 +558,11 @@ function objectMetadata(env) {
       bytes: env.EXPECTED_BYTES,
       plan_sha256: env.EXPECTED_PLAN_SHA256,
       github_artifact_digest: env.EXPECTED_GITHUB_ARTIFACT_DIGEST,
+      github_artifact_bytes: env.EXPECTED_GITHUB_ARTIFACT_BYTES,
+      publication_mode: JSON.parse(env.EXPECTED_PUBLICATION_METADATA).mode,
+      signed: String(JSON.parse(env.EXPECTED_PUBLICATION_METADATA).signed),
+      notarized: String(JSON.parse(env.EXPECTED_PUBLICATION_METADATA).notarized),
+      description: JSON.parse(env.EXPECTED_PUBLICATION_METADATA).description,
     },
   }
 }

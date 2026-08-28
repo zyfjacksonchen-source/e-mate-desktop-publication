@@ -34,9 +34,11 @@ Inputs:
 | --- | --- |
 | `source-sha` | Current protected `main`, shared by every admitted run and artifact |
 | `main-ci-run-id` | Successful attempt-1 formal RC `.github/workflows/ci.yml` `workflow_dispatch` run with `CI admission` and both platform jobs |
-| `macos-signer-run-id` | Exact successful attempt-1 `.github/workflows/desktop-macos-signing.yml` run with the unique signer job |
+| `macos-publication-mode` | Exact `signed` or `unsigned` contract; there is no fallback |
+| `macos-signer-run-id` | Exact successful attempt-1 `.github/workflows/desktop-macos-signing.yml` run with the unique signer job; required only for `signed` |
 | `admission-artifact-id` | Exact attempt-1 `e-mate-desktop-admission-<sha>` artifact |
-| `macos-signed-artifact-id` | Exact closed `e-mate-desktop-macos-signed-<sha>` artifact from the signer run |
+| `macos-signed-artifact-id` | Exact closed `e-mate-desktop-macos-signed-<sha>` artifact from the signer run; required only for `signed` |
+| `macos-unsigned-artifact-id` | Exact closed `e-mate-desktop-macos-<sha>` artifact from formal CI; required only for `unsigned` |
 | `windows-artifact-id` | Exact closed `e-mate-desktop-windows-<sha>` staging artifact from the admitted CI run |
 | `expected-signed-current` | Literal `absent`, or exact `<bytes>:<sha256>` for the plugin to recheck before activation |
 | `expected-legacy-current` | Exact approved `desktop/latest.json` predecessor `<bytes>:<sha256>` for the final bridge CAS; only the frozen final 2.0.13 signed manifest identity is accepted |
@@ -49,31 +51,37 @@ base-contract.json
 desktop-release-unsigned.json
 ```
 
-The unsigned manifest binds the final three-file Desktop artifact with darwin
-owned by the exact signer run and win32 owned by the exact formal CI run. The
-candidate artifact remains owned by `.github/workflows/desktop-release.yml`.
+The admitted manifest binds the final three-file Desktop artifact. In `signed`
+mode darwin is owned by the exact signer run; in `unsigned` mode darwin is owned
+by the exact formal CI run. Win32 is always owned by formal CI. The candidate
+artifact remains owned by `.github/workflows/desktop-release.yml`, with a
+mode-specific exact job name.
 The action verifies every GitHub API ID, name, archive digest, run, attempt,
 workflow, branch, source commit, required job, file set, byte count, and SHA-256.
 `mac-smoke`, extra files, path traversal, old attempts, or another source fail closed.
 
-The signed macOS artifact contains exactly the final DMG, blockmap, signed
-receipt, and verification receipt as ZIP `Stored` entries. The action
+In `signed` mode the macOS artifact contains exactly the final DMG, blockmap,
+signed receipt, and verification receipt as ZIP `Stored` entries. The action
 independently rechecks Developer ID identity/team, notarization `Accepted`,
 codesign, Gatekeeper, stapling, output-versus-input identity, Base/Harness, and
 all receipt bytes. It then follows the receipt's input artifact ID back to the
-formal CI `e-mate-desktop-macos-<sha>` artifact, downloads it, and revalidates
-its API digest/archive bytes, CI/runtime receipts, and input DMG. That unsigned
-artifact is signer input only and is never an immutable publication object.
-Windows continues through the existing exact CI staging validator. The plan
-binds the signed macOS and formal-CI Windows sources with:
+formal CI `e-mate-desktop-macos-<sha>` artifact and revalidates its API digest,
+archive bytes, CI/runtime receipts, DMG, and blockmap. That unsigned input is
+never an immutable publication object in signed mode.
+
+In `unsigned` mode the exact formal-CI macOS archive is the immutable source and
+must contain only the DMG, blockmap, CI receipt, and runtime receipt. Windows
+always contains only Setup.exe and the two CI receipts. Both modes bind:
 
 ```text
 github_artifact_id
 github_artifact_digest
+github_artifact_bytes
 github_run_id
 github_run_attempt = 1
 github_artifact_name
 github_archive_entries = exact ordered names and byte counts
+publication_metadata = exact mode/signed/notarized/description
 artifact_path
 bytes
 sha256
@@ -98,15 +106,19 @@ cloudflare-publication-plan.json
 cloudflare-plugin-handoff.json
 ```
 
-`desktop-release-signed.json` is the admitted 10-field schema-v2 manifest plus one
+`desktop-release-signed.json` is schema v4: it preserves the admitted schema-v2
+release fields, adds one exact `publication_metadata` object, and adds one
 domain-separated Ed25519 signature. Its signing context is
-`e-mate-desktop-release-manifest-v2\0`, and the private key must derive exactly
-the public key already present in the admitted Base.
+`e-mate-desktop-release-manifest-v4\0`, and the private key must derive exactly
+the public key already present in the admitted Base. Unsigned mode records both
+platforms as `mode=unsigned`, `signed=false`, and `notarized=false`; it never
+contains Developer ID or notary acceptance claims.
 
 `cloudflare-publication-plan.json` has a closed schema. It records:
 
 - status `ready-for-cloudflare-plugin` and authority `codex-cloudflare-plugin`;
-- exact repository, source, bucket, public origin, formal CI/signer/admission/candidate/signed-macOS/Windows artifact IDs;
+- exact repository, source, bucket, public origin, mode, formal CI and conditional signer/admission/candidate/macOS/Windows artifact IDs;
+- exact public description and per-platform signed/notarized metadata;
 - signed-manifest identity, bytes, SHA-256, Base, schedule protocol, and key ID;
 - macOS installer, Windows installer, and manual signed manifest as immutable objects;
 - `desktop/signed/latest.json` as the Base v7 active pointer, with exact expected current and `no-store`;
@@ -114,10 +126,9 @@ the public key already present in the admitted Base.
 
 The manual immutable manifest and both active pointers reference the same
 `desktop-release-signed.json` bytes and SHA-256. The signed bytes are also
-bounded by the 2.0.12 reader's 16 KiB limit. Old clients ignore fields they do
-not understand but still require the fixed R2 origin, immutable release path,
-byte count, SHA-256, installer format, codesign, native updater transaction and
-rollback; after this transition Base v7 reads only the signed pointer.
+bounded by the 2.0.12 reader's 16 KiB limit. A caller pinning this action must
+admit schema v4 and display its exact publication description/security state;
+schema v2/v3 exact-key readers must be updated before this action is dispatched.
 
 `cloudflare-plugin-handoff.json` binds the manifest and plan hashes to the exact
 action commit and GitHub provenance. It explicitly records that no production
@@ -138,11 +149,13 @@ The independent entrypoint is:
 zyfjacksonchen-source/e-mate-desktop-publication/performance@<40-character-commit>
 ```
 
-It accepts exact trusted IDs for the protected-main formal CI run, macOS signer
-run, final three-file Desktop artifact, Profile release run/artifact, four named
-current-run evidence artifacts, and Base signing key. Candidate darwin must bind
-the signer run and win32 must bind formal CI; candidate self-reporting never
-replaces either trusted input. It accepts no caller filesystem path. The
+It accepts the explicit macOS publication mode and exact trusted IDs for the
+protected-main formal CI run, conditional macOS signer run, final three-file
+Desktop artifact, Profile release run/artifact, four named current-run evidence
+artifacts, and Base signing key. Candidate darwin must bind the signer in signed
+mode and formal CI in unsigned mode; win32 always binds formal CI. Candidate
+self-reporting never replaces the trusted inputs. It accepts no caller
+filesystem path. The
 ordered roster is fixed to:
 
 1. `ecorex-chat` / `e-mate-enterprise` / `gpt-5.6-luna` / `max`
