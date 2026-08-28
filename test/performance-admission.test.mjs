@@ -75,8 +75,26 @@ describe('external performance admission owner', () => {
     const cases = [
       ['unprotected main', fixture => { fixture.config.refProtected = false }],
       ['private repository', fixture => { fixture.github.repository.visibility = 'private' }],
+      ['ordinary push cannot impersonate formal RC', fixture => { fixture.github.runs.get('100').event = 'push' }],
       ['rerun CI', fixture => { fixture.github.runs.get('100').runAttempt = 2 }],
+      ['darwin candidate bound to formal CI', fixture => {
+        const candidate = JSON.parse(fixture.github.file('202', 'desktop-candidate.json').buffer)
+        candidate.artifacts.darwin.build_run_id = '100'
+        fixture.github.replaceFile('202', 'desktop-candidate.json', pretty(candidate))
+      }],
+      ['win32 candidate bound to signer', fixture => {
+        const candidate = JSON.parse(fixture.github.file('202', 'desktop-candidate.json').buffer)
+        candidate.artifacts.win32.build_run_id = '105'
+        fixture.github.replaceFile('202', 'desktop-candidate.json', pretty(candidate))
+      }],
+      ['wrong trusted signer run', fixture => { fixture.config.macosSignerRunId = '102' }],
+      ['signer workflow path drift', fixture => { fixture.github.runs.get('105').path = '.github/workflows/ci.yml' }],
+      ['rerun signer', fixture => { fixture.github.runs.get('105').runAttempt = 2 }],
+      ['failed signer job', fixture => { fixture.github.jobs.get('105')[0].conclusion = 'failure' }],
       ['rerun Desktop build', fixture => { fixture.github.runs.get('102').runAttempt = 2 }],
+      ['old Desktop release job name', fixture => {
+        fixture.github.jobs.set('102', [job('Bind exact protected-main CI artifacts to the release manifest')])
+      }],
       ['failed TTFT job', fixture => { fixture.github.jobs.get('103')[0].conclusion = 'failure' }],
       ['failed Profile publication job', fixture => { fixture.github.jobs.get('104')[0].conclusion = 'failure' }],
       ['rerun Profile publication', fixture => { fixture.github.runs.get('104').runAttempt = 2 }],
@@ -211,6 +229,7 @@ describe('external performance admission owner', () => {
     const action = await readFile(new URL('../performance/action.yml', import.meta.url), 'utf8')
     const main = await readFile(new URL('../src/performance-main.mjs', import.meta.url), 'utf8')
     assert.match(action, /desktop-artifact-id:/u)
+    assert.match(action, /macos-signer-run-id:/u)
     assert.match(action, /profile-release-run-id:/u)
     assert.match(action, /profile-artifact-id:/u)
     for (const input of ['luna', 'sol', 'deepseek', 'doubao']) {
@@ -234,7 +253,7 @@ function performanceFixture() {
     schema_version: 2,
     document_type: 'emate.desktop-artifact-candidate',
     release_status: 'admission-pending',
-    version: '2.0.14',
+    version: '2.0.15',
     source_commit: SOURCE,
     schedule_protocol_floor: 1,
     artifacts: {
@@ -289,8 +308,8 @@ function performanceFixture() {
     artifacts: [
       githubArtifact('202', `e-mate-desktop-release-${SOURCE}`, '102', {
         'desktop-candidate.json': pretty(candidate),
-        'e-Mate-2.0.14-mac-universal.dmg': mac,
-        'e-Mate-2.0.14-win-x64-Setup.exe': win,
+        'e-Mate-2.0.15-mac-universal.dmg': mac,
+        'e-Mate-2.0.15-win-x64-Setup.exe': win,
       }),
       githubArtifact('203', performanceEvidenceArtifactName(SOURCE, 1), '103', {
         [PERFORMANCE_EVIDENCE_FILENAME]: pretty(evidence),
@@ -317,6 +336,7 @@ function performanceFixture() {
     githubSha: SOURCE,
     sourceCommit: SOURCE,
     mainCiRunId: '100',
+    macosSignerRunId: '105',
     currentRunId: '103',
     currentRunAttempt: '1',
     desktopArtifactId: '202',
@@ -394,7 +414,7 @@ class FakeGithub {
       disabled: false,
     }
     this.runs = new Map([
-      ['100', run('100', '.github/workflows/ci.yml', 'push')],
+      ['100', run('100', '.github/workflows/ci.yml', 'workflow_dispatch')],
       ['102', run('102', '.github/workflows/desktop-release.yml', 'workflow_dispatch')],
       ['103', {
         ...run('103', '.github/workflows/desktop-performance.yml', 'workflow_dispatch'),
@@ -402,17 +422,18 @@ class FakeGithub {
         conclusion: null,
       }],
       ['104', run('104', '.github/workflows/profile-release.yml', 'workflow_dispatch')],
+      ['105', run('105', '.github/workflows/desktop-macos-signing.yml', 'workflow_dispatch')],
     ])
     this.jobs = new Map([
-      ['100', [job('CI admission')]],
-      ['102', [
-        job('Build and verify the e-Mate profile'),
-        job('Build unsigned Windows x64 installer'),
-        job('Build unsigned macOS universal disk image'),
-        job('Bind native artifacts to the release manifest'),
+      ['100', [
+        job('CI admission'),
+        job('Windows x64 / unsigned desktop installer'),
+        job('macOS universal / unsigned desktop disk image'),
       ]],
+      ['102', [job('Bind exact signed macOS and protected-main CI Windows bytes')]],
       ['103', [job('TTFT evidence')]],
       ['104', [job('Prepare signed native Cloudflare publication bundle')]],
+      ['105', [job('Sign and notarize exact accepted macOS bytes')]],
     ])
     this.artifacts = new Map(artifacts.map(value => [value.metadata.id, value]))
     this.sourceFiles = sourceFiles
@@ -467,7 +488,7 @@ function performanceEvidence(candidate, aggregate) {
   }
   return {
     schema_version: 2,
-    comparison_kind: 'installed-2.0.12-vs-2.0.14',
+    comparison_kind: 'installed-2.0.12-vs-2.0.15',
     performance_run_id: 'production-performance-run-1',
     evidence_kind: 'production-real-provider',
     harness_commit: HARNESS,
@@ -487,21 +508,29 @@ function supportingPaths(evidence) {
 
 function artifactRecord(platform, bytes) {
   const name = platform === 'darwin'
-    ? 'e-Mate-2.0.14-mac-universal.dmg'
-    : 'e-Mate-2.0.14-win-x64-Setup.exe'
+    ? 'e-Mate-2.0.15-mac-universal.dmg'
+    : 'e-Mate-2.0.15-win-x64-Setup.exe'
   return {
-    url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.14/${SOURCE}/${name}`,
+    url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.15/${SOURCE}/${name}`,
     bytes: bytes.byteLength,
     sha256: sha256(bytes),
     build_source_commit: SOURCE,
-    build_run_id: '102',
+    build_run_id: platform === 'darwin' ? '105' : '100',
   }
 }
 
 function githubArtifact(id, name, runId, files) {
   const archiveSha256 = String(Number(id) + 1).padStart(64, '0')
   return {
-    metadata: { id, name, runId, digest: `sha256:${archiveSha256}`, expired: false },
+    metadata: {
+      id,
+      name,
+      runId,
+      digest: `sha256:${archiveSha256}`,
+      expired: false,
+      sourceCommit: SOURCE,
+      bytes: Number(id) + 1000,
+    },
     bundle: {
       archiveSha256,
       files: new Map(Object.entries(files).map(([path, bytes]) => [path, testSource(bytes)])),
@@ -526,6 +555,6 @@ function sha256(bytes) { return createHash('sha256').update(bytes).digest('hex')
 
 assert.deepEqual(DESKTOP_RELEASE_ARTIFACT_FILES, [
   'desktop-candidate.json',
-  'e-Mate-2.0.14-mac-universal.dmg',
-  'e-Mate-2.0.14-win-x64-Setup.exe',
+  'e-Mate-2.0.15-mac-universal.dmg',
+  'e-Mate-2.0.15-win-x64-Setup.exe',
 ])

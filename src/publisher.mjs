@@ -10,7 +10,7 @@ export const EXPECTED_REPOSITORY = 'zyfjacksonchen-source/e-Mate-2.0.11'
 export const EXPECTED_ACTION_REPOSITORY = 'zyfjacksonchen-source/e-mate-desktop-publication'
 export const PUBLIC_ORIGIN = 'https://pub-ada3f610c0234a76838f4e19fe2bb25e.r2.dev'
 export const EXPECTED_R2_BUCKET = 'emate-desktop-downloads'
-export const RELEASE_VERSION = '2.0.14'
+export const RELEASE_VERSION = '2.0.15'
 export const RELEASE_SIGNATURE_CONTEXT = Buffer.from('e-mate-desktop-release-manifest-v2\0', 'utf8')
 export const PERFORMANCE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-admission-v1\0', 'utf8')
 export const PERFORMANCE_AGGREGATE_SIGNATURE_CONTEXT = Buffer.from('e-mate-performance-aggregate-admission-v1\0', 'utf8')
@@ -30,6 +30,8 @@ export const DESKTOP_RELEASE_ARTIFACT_NAMES = Object.freeze({
 export const DESKTOP_RELEASE_ARTIFACT_FILES = Object.freeze(Object.values(DESKTOP_RELEASE_ARTIFACT_NAMES))
 const DESKTOP_CI_RECEIPT = 'desktop-artifact-receipt.json'
 const DESKTOP_RUNTIME_RECEIPT = 'desktop-runtime-verification.json'
+const MACOS_SIGNED_RECEIPT = 'desktop-macos-signed-receipt.json'
+const MACOS_SIGNED_VERIFICATION = 'desktop-macos-signed-verification.json'
 export const LEGACY_PREDECESSOR = Object.freeze({
   key: 'desktop/latest.json',
   bytes: 2961,
@@ -39,11 +41,20 @@ export const LEGACY_PREDECESSOR = Object.freeze({
 const SHA256 = /^[0-9a-f]{64}$/u
 const SHA40 = /^[0-9a-f]{40}$/u
 const RUN_ID = /^[1-9][0-9]*$/u
+const TEAM_ID = /^[A-Z0-9]{10}$/u
+const NOTARY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
 const BASE_ID = /^e-mate-desktop-profile-v[1-9][0-9]*-dsh-[0-9a-f]{12}$/u
 const KEY_ID = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/u
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u
 const BASE_RUNTIME_PACKAGE = /^(?:@deepseek-ai\/[a-z0-9][a-z0-9._-]*|@e-mate\/desktop\/vision-toolkit|react(?:-dom)?)$/u
 const TARGETS = ['darwin-arm64', 'darwin-x64', 'win32-x64']
+const FORMAL_CI_JOBS = [
+  'CI admission',
+  'Windows x64 / unsigned desktop installer',
+  'macOS universal / unsigned desktop disk image',
+]
+const MACOS_SIGNER_JOB = 'Sign and notarize exact accepted macOS bytes'
+const DESKTOP_RELEASE_JOB = 'Bind exact signed macOS and protected-main CI Windows bytes'
 const MAX_JSON_BYTES = 64 * 1024
 const LEGACY_MANIFEST_MAX_BYTES = 16 * 1024
 const IMMUTABLE_CACHE = 'public,max-age=31536000,immutable'
@@ -149,15 +160,23 @@ export async function createPerformanceAdmission(config, dependencies) {
   await validateProtectedMain(github, config)
   await validateRun(github, config.mainCiRunId, {
     path: '.github/workflows/ci.yml',
-    event: 'push',
+    event: 'workflow_dispatch',
     sourceCommit: config.sourceCommit,
-    jobs: ['CI admission'],
+    jobs: FORMAL_CI_JOBS,
+  })
+  await validateRun(github, config.macosSignerRunId, {
+    path: '.github/workflows/desktop-macos-signing.yml',
+    event: 'workflow_dispatch',
+    sourceCommit: config.sourceCommit,
+    jobs: [MACOS_SIGNER_JOB],
+    uniqueJobs: true,
   })
 
   const desktopArtifact = await github.getArtifact(config.desktopArtifactId)
   assertArtifactMetadata(desktopArtifact, {
     id: config.desktopArtifactId,
     name: `e-mate-desktop-release-${config.sourceCommit}`,
+    sourceCommit: config.sourceCommit,
   })
   const desktopBundle = await github.downloadArtifact(config.desktopArtifactId)
   assertDownloadedArtifact(desktopBundle, desktopArtifact)
@@ -178,38 +197,16 @@ export async function createPerformanceAdmission(config, dependencies) {
     signatureKeyId: config.signingKeyId,
   }, config)
 
-  if (String(candidate.artifacts.darwin.build_run_id) !== String(desktopArtifact.runId)) {
-    throw new Error('macOS installer build run is not the exact candidate run')
+  if (String(candidate.artifacts.darwin.build_run_id) !== config.macosSignerRunId
+    || String(candidate.artifacts.win32.build_run_id) !== config.mainCiRunId) {
+    throw new Error('performance candidate platform build owners are invalid')
   }
-  const reusedWindowsRunId = String(candidate.artifacts.win32.build_run_id) === String(desktopArtifact.runId)
-    ? undefined
-    : String(candidate.artifacts.win32.build_run_id)
   await validateRun(github, desktopArtifact.runId, {
     path: '.github/workflows/desktop-release.yml',
     event: 'workflow_dispatch',
     sourceCommit: config.sourceCommit,
-    jobs: reusedWindowsRunId === undefined
-      ? [
-          'Build and verify the e-Mate profile',
-          'Build unsigned Windows x64 installer',
-          'Build unsigned macOS universal disk image',
-          'Bind native artifacts to the release manifest',
-        ]
-      : [
-          'Validate reusable profile and Windows artifacts',
-          'Build unsigned macOS universal disk image',
-          'Bind native artifacts to the release manifest',
-        ],
+    jobs: [DESKTOP_RELEASE_JOB],
   })
-  if (reusedWindowsRunId !== undefined) {
-    await validateRun(github, reusedWindowsRunId, {
-      path: '.github/workflows/desktop-release.yml',
-      event: 'workflow_dispatch',
-      sourceCommit: config.sourceCommit,
-      requireSuccessfulRun: false,
-      jobs: ['Build and verify the e-Mate profile', 'Build unsigned Windows x64 installer'],
-    })
-  }
 
   for (const platform of ['darwin', 'win32']) {
     const source = requiredFile(desktopBundle.files, artifactNames[platform])
@@ -337,13 +334,16 @@ export async function prepareDesktopPublication(config, dependencies) {
   await validateProtectedMain(github, config)
   await validateRun(github, config.mainCiRunId, {
     path: '.github/workflows/ci.yml',
-    event: 'push',
+    event: 'workflow_dispatch',
     sourceCommit: config.sourceCommit,
-    jobs: [
-      'CI admission',
-      'Windows x64 / unsigned desktop installer',
-      'macOS universal / unsigned desktop disk image',
-    ],
+    jobs: FORMAL_CI_JOBS,
+  })
+  await validateRun(github, config.macosSignerRunId, {
+    path: '.github/workflows/desktop-macos-signing.yml',
+    event: 'workflow_dispatch',
+    sourceCommit: config.sourceCommit,
+    jobs: [MACOS_SIGNER_JOB],
+    uniqueJobs: true,
   })
 
   const admissionArtifact = await github.getArtifact(config.admissionArtifactId)
@@ -377,15 +377,15 @@ export async function prepareDesktopPublication(config, dependencies) {
 
   const provenance = unsigned.github_artifact_provenance
   const [candidateReference] = provenance.artifacts
-  if (unsigned.artifacts.darwin.build_run_id !== config.mainCiRunId
+  if (unsigned.artifacts.darwin.build_run_id !== config.macosSignerRunId
     || unsigned.artifacts.win32.build_run_id !== config.mainCiRunId) {
-    throw new Error('Desktop installers are not owned by the exact protected-main CI run')
+    throw new Error('Desktop installers are not owned by the exact signer and formal CI runs')
   }
   const candidateArtifact = await validateProvenanceArtifact(github, candidateReference, {
     path: '.github/workflows/desktop-release.yml',
     event: 'workflow_dispatch',
     sourceCommit: config.sourceCommit,
-    jobs: ['Bind exact protected-main CI artifacts to the release manifest'],
+    jobs: [DESKTOP_RELEASE_JOB],
   })
   const candidateBundle = await github.downloadArtifact(candidateReference.artifact_id)
   assertDownloadedArtifact(candidateBundle, candidateArtifact)
@@ -398,40 +398,103 @@ export async function prepareDesktopPublication(config, dependencies) {
   )
   validateCandidate(candidate, unsigned)
 
-  const stagingArtifacts = {}
   for (const platform of ['darwin', 'win32']) {
     const source = requiredFile(candidateBundle.files, artifactNames[platform])
     const expected = unsigned.artifacts[platform]
     if (source.bytes !== expected.bytes || await source.digest() !== expected.sha256) {
       throw new Error(`GitHub ${platform} installer bytes do not match the admitted manifest`)
     }
-    const stagingArtifactId = platform === 'darwin' ? config.macosArtifactId : config.windowsArtifactId
-    const stagingName = `e-mate-desktop-${platform === 'darwin' ? 'macos' : 'windows'}-${config.sourceCommit}`
-    const stagingArtifact = await github.getArtifact(stagingArtifactId)
-    assertArtifactMetadata(stagingArtifact, {
-      id: stagingArtifactId,
-      name: stagingName,
-      runId: config.mainCiRunId,
-    })
-    const stagingBundle = await github.downloadArtifact(stagingArtifactId)
-    assertDownloadedArtifact(stagingBundle, stagingArtifact)
-    assertNoMacSmoke(stagingBundle.files)
-    const archiveEntries = await validateDesktopCiStagingArtifact(stagingBundle, {
-      platform,
-      installerName: artifactNames[platform],
-      expected,
-      sourceCommit: config.sourceCommit,
-      ciRunId: config.mainCiRunId,
-      base,
-    })
-    stagingArtifacts[platform] = {
-      id: String(stagingArtifact.id),
-      name: stagingArtifact.name,
-      digest: stagingArtifact.digest,
-      runId: String(stagingArtifact.runId),
+  }
+
+  const signedMacosArtifact = await github.getArtifact(config.macosSignedArtifactId)
+  assertArtifactMetadata(signedMacosArtifact, {
+    id: config.macosSignedArtifactId,
+    name: `e-mate-desktop-macos-signed-${config.sourceCommit}`,
+    runId: config.macosSignerRunId,
+    sourceCommit: config.sourceCommit,
+  })
+  const signedMacosBundle = await github.downloadArtifact(config.macosSignedArtifactId)
+  assertDownloadedArtifact(signedMacosBundle, signedMacosArtifact)
+  assertNoMacSmoke(signedMacosBundle.files)
+  const signedMacos = await validateSignedMacosArtifact(signedMacosBundle, {
+    sourceCommit: config.sourceCommit,
+    ciRunId: config.mainCiRunId,
+    base,
+    expected: unsigned.artifacts.darwin,
+    installerName: artifactNames.darwin,
+  })
+
+  const macosCiInputArtifact = await github.getArtifact(signedMacos.input.artifact_id)
+  assertArtifactMetadata(macosCiInputArtifact, {
+    id: signedMacos.input.artifact_id,
+    name: signedMacos.input.artifact_name,
+    digest: signedMacos.input.artifact_api_digest,
+    runId: config.mainCiRunId,
+    sourceCommit: config.sourceCommit,
+    bytes: signedMacos.input.artifact_archive_bytes,
+  })
+  const macosCiInputBundle = await github.downloadArtifact(signedMacos.input.artifact_id)
+  assertDownloadedArtifact(macosCiInputBundle, macosCiInputArtifact)
+  assertNoMacSmoke(macosCiInputBundle.files)
+  await validateDesktopCiStagingArtifact(macosCiInputBundle, {
+    platform: 'darwin',
+    installerName: artifactNames.darwin,
+    expected: signedMacos.input.dmg,
+    sourceCommit: config.sourceCommit,
+    ciRunId: config.mainCiRunId,
+    base,
+  })
+  await assertFileIdentity(
+    requiredFile(macosCiInputBundle.files, DESKTOP_CI_RECEIPT),
+    signedMacos.input.desktop_artifact_receipt,
+    'signed macOS input CI receipt',
+  )
+  await assertFileIdentity(
+    requiredFile(macosCiInputBundle.files, DESKTOP_RUNTIME_RECEIPT),
+    signedMacos.input.runtime_verification_receipt,
+    'signed macOS input runtime receipt',
+  )
+  await assertFileIdentity(
+    requiredFile(macosCiInputBundle.files, artifactNames.darwin),
+    signedMacos.input.dmg,
+    'signed macOS input DMG',
+  )
+
+  const windowsArtifact = await github.getArtifact(config.windowsArtifactId)
+  assertArtifactMetadata(windowsArtifact, {
+    id: config.windowsArtifactId,
+    name: `e-mate-desktop-windows-${config.sourceCommit}`,
+    runId: config.mainCiRunId,
+    sourceCommit: config.sourceCommit,
+  })
+  const windowsBundle = await github.downloadArtifact(config.windowsArtifactId)
+  assertDownloadedArtifact(windowsBundle, windowsArtifact)
+  assertNoMacSmoke(windowsBundle.files)
+  const windowsArchiveEntries = await validateDesktopCiStagingArtifact(windowsBundle, {
+    platform: 'win32',
+    installerName: artifactNames.win32,
+    expected: unsigned.artifacts.win32,
+    sourceCommit: config.sourceCommit,
+    ciRunId: config.mainCiRunId,
+    base,
+  })
+  const stagingArtifacts = {
+    darwin: {
+      id: String(signedMacosArtifact.id),
+      name: signedMacosArtifact.name,
+      digest: signedMacosArtifact.digest,
+      runId: String(signedMacosArtifact.runId),
       runAttempt: 1,
-      archiveEntries,
-    }
+      archiveEntries: signedMacos.archiveEntries,
+    },
+    win32: {
+      id: String(windowsArtifact.id),
+      name: windowsArtifact.name,
+      digest: windowsArtifact.digest,
+      runId: String(windowsArtifact.runId),
+      runAttempt: 1,
+      archiveEntries: windowsArchiveEntries,
+    },
   }
 
   const signatureValue = sign(
@@ -506,9 +569,10 @@ export async function prepareDesktopPublication(config, dependencies) {
   }
   const githubBinding = {
     main_ci_run_id: config.mainCiRunId,
+    macos_signer_run_id: config.macosSignerRunId,
     admission_artifact_id: config.admissionArtifactId,
     desktop_artifact_id: candidateReference.artifact_id,
-    macos_staging_artifact_id: config.macosArtifactId,
+    macos_signed_artifact_id: config.macosSignedArtifactId,
     windows_staging_artifact_id: config.windowsArtifactId,
   }
   const publicationPlan = {
@@ -593,7 +657,8 @@ function validateInvocation(config) {
   if (!SHA40.test(config.sourceCommit) || config.githubSha !== config.sourceCommit) {
     throw new Error('caller source commit is invalid or does not match GITHUB_SHA')
   }
-  if (![config.mainCiRunId, config.admissionArtifactId, config.macosArtifactId, config.windowsArtifactId]
+  if (![config.mainCiRunId, config.macosSignerRunId, config.admissionArtifactId,
+    config.macosSignedArtifactId, config.windowsArtifactId]
     .every(value => RUN_ID.test(value ?? ''))) {
     throw new Error('GitHub admission identity is invalid')
   }
@@ -622,7 +687,7 @@ function validatePerformanceInvocation(config) {
   if (!SHA40.test(config.sourceCommit) || config.githubSha !== config.sourceCommit) {
     throw new Error('caller source commit is invalid or does not match GITHUB_SHA')
   }
-  if (![config.mainCiRunId, config.currentRunId, config.currentRunAttempt, config.desktopArtifactId,
+  if (![config.mainCiRunId, config.macosSignerRunId, config.currentRunId, config.currentRunAttempt, config.desktopArtifactId,
     config.profileReleaseRunId, config.profileReleaseArtifactId, config.evidenceArtifactId]
     .every(value => RUN_ID.test(value ?? ''))) {
     throw new Error('performance admission GitHub identity is invalid')
@@ -654,8 +719,12 @@ async function validateRun(github, runId, expected) {
   }
   const jobs = await github.getRunJobs(String(runId))
   for (const name of expected.jobs) {
-    if (!jobs.some(job => job.name === name && job.status === 'completed' && job.conclusion === 'success')) {
+    const matches = jobs.filter(job => job.name === name && job.status === 'completed' && job.conclusion === 'success')
+    if (matches.length === 0) {
       throw new Error(`GitHub run ${runId} is missing successful job ${name}`)
+    }
+    if (expected.uniqueJobs === true && matches.length !== 1) {
+      throw new Error(`GitHub run ${runId} job is not uniquely successful: ${name}`)
     }
   }
   return run
@@ -688,6 +757,7 @@ async function validateProvenanceArtifact(github, reference, runExpected) {
     name: reference.name,
     digest: reference.digest,
     runId: reference.run_id,
+    sourceCommit: runExpected.sourceCommit,
   })
   const run = await validateRun(github, reference.run_id, runExpected)
   if (run.runAttempt !== reference.run_attempt) throw new Error('GitHub artifact run attempt drifted')
@@ -698,7 +768,9 @@ function assertArtifactMetadata(actual, expected) {
   if (String(actual?.id) !== String(expected.id) || actual.name !== expected.name
     || actual.expired !== false || !/^sha256:[0-9a-f]{64}$/u.test(actual.digest ?? '')
     || expected.digest !== undefined && actual.digest !== expected.digest
-    || expected.runId !== undefined && String(actual.runId) !== String(expected.runId)) {
+    || expected.runId !== undefined && String(actual.runId) !== String(expected.runId)
+    || expected.sourceCommit !== undefined && actual.sourceCommit !== expected.sourceCommit
+    || expected.bytes !== undefined && actual.bytes !== expected.bytes) {
     throw new Error(`GitHub artifact ${expected.id} provenance is invalid`)
   }
 }
@@ -769,6 +841,106 @@ async function validateDesktopCiStagingArtifact(bundle, context) {
     throw new Error(`GitHub ${context.platform} Desktop runtime verification receipt is invalid`)
   }
   return actual.map(name => ({ name, bytes: requiredFile(bundle.files, name).bytes }))
+}
+
+async function validateSignedMacosArtifact(bundle, context) {
+  const blockmapName = `${context.installerName}.blockmap`
+  const actual = [...bundle.files.keys()].sort()
+  const expectedFiles = [
+    context.installerName,
+    blockmapName,
+    MACOS_SIGNED_RECEIPT,
+    MACOS_SIGNED_VERIFICATION,
+  ].sort()
+  if (canonicalJson(actual) !== canonicalJson(expectedFiles)) {
+    throw new Error(`GitHub signed macOS artifact file set drifted: ${actual.join(', ')}`)
+  }
+  if (typeof bundle.storedEntries !== 'function') {
+    throw new Error('GitHub signed macOS artifact has no compression receipt')
+  }
+  const stored = await bundle.storedEntries()
+  if (!(stored instanceof Set) || actual.some(name => !stored.has(name))) {
+    throw new Error('GitHub signed macOS artifact is not entirely compression-level-0 stored')
+  }
+
+  const receipt = parsePrettyJson(
+    await readSmall(requiredFile(bundle.files, MACOS_SIGNED_RECEIPT)),
+    'GitHub signed macOS release receipt',
+  )
+  const input = receipt.input
+  const output = receipt.output
+  const identity = receipt.developer_id?.identity
+  const team = /^Developer ID Application: .+ \(([A-Z0-9]{10})\)$/u.exec(identity ?? '')?.[1]
+  if (!hasExactKeys(receipt, [
+    'schema_version', 'document_type', 'source_commit', 'ci_run_id', 'base_contract_id',
+    'harness_commit', 'input', 'output', 'developer_id', 'notarization',
+  ]) || receipt.schema_version !== 1 || receipt.document_type !== 'emate.desktop-macos-signed-release'
+    || receipt.source_commit !== context.sourceCommit || receipt.ci_run_id !== context.ciRunId
+    || receipt.base_contract_id !== context.base.id || receipt.harness_commit !== context.base.harness_commit
+    || !hasExactKeys(input, [
+      'artifact_id', 'artifact_name', 'artifact_api_digest', 'artifact_archive_bytes',
+      'desktop_artifact_receipt', 'runtime_verification_receipt', 'dmg', 'signing',
+    ]) || !RUN_ID.test(input.artifact_id ?? '')
+    || input.artifact_name !== `e-mate-desktop-macos-${context.sourceCommit}`
+    || !/^sha256:[0-9a-f]{64}$/u.test(input.artifact_api_digest ?? '')
+    || !positiveInteger(input.artifact_archive_bytes)
+    || !validFileIdentity(input.desktop_artifact_receipt, DESKTOP_CI_RECEIPT)
+    || !validFileIdentity(input.runtime_verification_receipt, DESKTOP_RUNTIME_RECEIPT)
+    || !validFileIdentity(input.dmg, context.installerName) || input.signing !== 'adhoc'
+    || !hasExactKeys(output, ['dmg', 'blockmap', 'signing', 'notarized'])
+    || !validFileIdentity(output.dmg, context.installerName)
+    || !validFileIdentity(output.blockmap, blockmapName)
+    || output.signing !== 'developer-id' || output.notarized !== true
+    || output.dmg.bytes !== context.expected.bytes || output.dmg.sha256 !== context.expected.sha256
+    || output.dmg.sha256 === input.dmg.sha256
+    || !hasExactKeys(receipt.developer_id, ['identity', 'team_id', 'credential_source'])
+    || typeof identity !== 'string' || team === undefined || !TEAM_ID.test(receipt.developer_id.team_id ?? '')
+    || receipt.developer_id.team_id !== team
+    || !['keychain', 'p12'].includes(receipt.developer_id.credential_source)
+    || !hasExactKeys(receipt.notarization, ['credential_source', 'submission_id', 'status'])
+    || !['api-key', 'apple-id', 'keychain-profile'].includes(receipt.notarization.credential_source)
+    || !NOTARY_ID.test(receipt.notarization.submission_id ?? '') || receipt.notarization.status !== 'Accepted') {
+    throw new Error('GitHub signed macOS release receipt is invalid')
+  }
+  await assertFileIdentity(requiredFile(bundle.files, context.installerName), output.dmg, 'signed macOS output DMG')
+  await assertFileIdentity(requiredFile(bundle.files, blockmapName), output.blockmap, 'signed macOS output blockmap')
+
+  const verification = parsePrettyJson(
+    await readSmall(requiredFile(bundle.files, MACOS_SIGNED_VERIFICATION)),
+    'GitHub signed macOS verification',
+  )
+  if (!hasExactKeys(verification, [
+    'schema_version', 'document_type', 'source_commit', 'ci_run_id',
+    'input_dmg_sha256', 'output_dmg_sha256', 'checks',
+  ]) || verification.schema_version !== 1
+    || verification.document_type !== 'emate.desktop-macos-signed-verification'
+    || verification.source_commit !== context.sourceCommit || verification.ci_run_id !== context.ciRunId
+    || verification.input_dmg_sha256 !== input.dmg.sha256
+    || verification.output_dmg_sha256 !== output.dmg.sha256
+    || !hasExactKeys(verification.checks, [
+      'codesign_app', 'codesign_dmg', 'gatekeeper_app', 'gatekeeper_dmg', 'stapler_dmg', 'verify_mac_release',
+    ]) || verification.checks.codesign_app !== 'passed' || verification.checks.codesign_dmg !== 'passed'
+    || verification.checks.gatekeeper_app !== 'accepted' || verification.checks.gatekeeper_dmg !== 'accepted'
+    || verification.checks.stapler_dmg !== 'valid' || verification.checks.verify_mac_release !== 'passed') {
+    throw new Error('GitHub signed macOS verification is invalid')
+  }
+  return {
+    input,
+    output,
+    archiveEntries: actual.map(name => ({ name, bytes: requiredFile(bundle.files, name).bytes })),
+  }
+}
+
+function validFileIdentity(value, name) {
+  return hasExactKeys(value, ['name', 'bytes', 'sha256']) && value.name === name
+    && positiveInteger(value.bytes) && SHA256.test(value.sha256 ?? '')
+}
+
+async function assertFileIdentity(source, expected, context) {
+  if (!validFileIdentity(expected, expected?.name) || source.bytes !== expected.bytes
+    || await source.digest() !== expected.sha256) {
+    throw new Error(`${context} bytes drifted`)
+  }
 }
 
 function validateUnsignedManifest(value, sourceCommit) {

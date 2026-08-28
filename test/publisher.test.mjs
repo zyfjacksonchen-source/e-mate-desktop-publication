@@ -24,6 +24,9 @@ import { parseStoredArchiveEntries, validateArchiveEntries } from '../src/main.m
 const SOURCE = 'a'.repeat(40)
 const BASE_ID = `e-mate-desktop-profile-v7-dsh-${SOURCE.slice(0, 12)}`
 const KEY_ID = 'e0a81164526dcbcd'
+const MACOS_CI_ARCHIVE_SHA256 = 'a'.repeat(64)
+const MACOS_CI_ARCHIVE_BYTES = 1206
+const DEVELOPER_TEAM_ID = 'ABCDE12345'
 
 describe('external Desktop Cloudflare plugin handoff owner', () => {
   it('initializes the GitHub client before running the executable entrypoint', () => {
@@ -67,6 +70,14 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     ])
     assert.equal(plan.status, 'ready-for-cloudflare-plugin')
     assert.equal(plan.publication_authority, 'codex-cloudflare-plugin')
+    assert.deepEqual(plan.github, {
+      main_ci_run_id: '100',
+      macos_signer_run_id: '105',
+      admission_artifact_id: '201',
+      desktop_artifact_id: '202',
+      macos_signed_artifact_id: '208',
+      windows_staging_artifact_id: '207',
+    })
     assert.equal(plan.active_pointer.execution_order, 'before-legacy-bootstrap')
     assert.equal(plan.active_pointer.expected_current, 'absent')
     assert.equal(plan.active_pointer.cache_control, 'no-store')
@@ -83,24 +94,25 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     })
 
     const [mac, win, manual] = plan.immutable_objects
-    assert.deepEqual([mac.github_artifact_id, win.github_artifact_id], ['206', '207'])
-    assert.deepEqual([mac.github_run_id, win.github_run_id], ['100', '100'])
+    assert.deepEqual([mac.github_artifact_id, win.github_artifact_id], ['208', '207'])
+    assert.deepEqual([mac.github_run_id, win.github_run_id], ['105', '100'])
     assert.deepEqual([mac.github_run_attempt, win.github_run_attempt], [1, 1])
     assert.deepEqual([mac.github_artifact_name, win.github_artifact_name], [
-      `e-mate-desktop-macos-${SOURCE}`,
+      `e-mate-desktop-macos-signed-${SOURCE}`,
       `e-mate-desktop-windows-${SOURCE}`,
     ])
     assert.deepEqual([mac.artifact_path, win.artifact_path], DESKTOP_RELEASE_ARTIFACT_FILES.slice(1))
     assert.ok([mac, win].every(item => /^sha256:[0-9a-f]{64}$/u.test(item.github_artifact_digest)))
     assert.deepEqual(mac.github_archive_entries.map(item => item.name), [
-      'desktop-artifact-receipt.json',
-      'desktop-runtime-verification.json',
-      'e-Mate-2.0.14-mac-universal.dmg',
+      'desktop-macos-signed-receipt.json',
+      'desktop-macos-signed-verification.json',
+      'e-Mate-2.0.15-mac-universal.dmg',
+      'e-Mate-2.0.15-mac-universal.dmg.blockmap',
     ])
     assert.deepEqual(win.github_archive_entries.map(item => item.name), [
       'desktop-artifact-receipt.json',
       'desktop-runtime-verification.json',
-      'e-Mate-2.0.14-win-x64-Setup.exe',
+      'e-Mate-2.0.15-win-x64-Setup.exe',
     ])
     assert.equal(manual.artifact_path, SIGNED_MANIFEST_FILENAME)
     for (const field of ['bytes', 'sha256', 'content_type']) {
@@ -147,18 +159,18 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
     await assert.rejects(fixture.prepare(), /exact approved predecessor/u)
   })
 
-  it('accepts a real optional blockmap only when the CI receipts bind every byte', async () => {
+  it('binds the mandatory signed blockmap without turning it or the unsigned CI input into an immutable object', async () => {
     const fixture = releaseFixture()
-    fixture.github.replaceStagingFiles('206', stagingFiles('darwin', Buffer.from('exact-mac-installer'), Buffer.from('exact-blockmap')))
     const result = await fixture.prepare()
     const plan = JSON.parse(await result.files.get(PUBLICATION_PLAN_FILENAME).read())
-    assert.equal(plan.immutable_objects[0].artifact_path, 'e-Mate-2.0.14-mac-universal.dmg')
+    assert.equal(plan.immutable_objects[0].artifact_path, 'e-Mate-2.0.15-mac-universal.dmg')
     assert.equal(plan.immutable_objects.some(item => item.artifact_path.endsWith('.blockmap')), false)
+    assert.equal(plan.immutable_objects.some(item => item.github_artifact_id === '206'), false)
     assert.deepEqual(plan.immutable_objects[0].github_archive_entries.map(item => item.name), [
-      'desktop-artifact-receipt.json',
-      'desktop-runtime-verification.json',
-      'e-Mate-2.0.14-mac-universal.dmg',
-      'e-Mate-2.0.14-mac-universal.dmg.blockmap',
+      'desktop-macos-signed-receipt.json',
+      'desktop-macos-signed-verification.json',
+      'e-Mate-2.0.15-mac-universal.dmg',
+      'e-Mate-2.0.15-mac-universal.dmg.blockmap',
     ])
   })
 
@@ -167,10 +179,66 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
       ['unexpected repository', fixture => { fixture.config.repository = 'zyfjacksonchen-source/e-Mate' }],
       ['unprotected main', fixture => { fixture.config.refProtected = false }],
       ['private repository', fixture => { fixture.github.repository.visibility = 'private' }],
+      ['ordinary push cannot impersonate formal RC', fixture => { fixture.github.runs.get('100').event = 'push' }],
       ['failed CI', fixture => { fixture.github.jobs.get('100')[0].conclusion = 'failure' }],
       ['rerun CI', fixture => { fixture.github.runs.get('100').runAttempt = 2 }],
+      ['2.0.14 manifest', fixture => {
+        mutateJson(fixture, '201', 'desktop-release-unsigned.json', value => { value.version = '2.0.14' })
+      }],
+      ['darwin bound to formal CI instead of signer', fixture => {
+        for (const [id, name] of [['201', 'desktop-release-unsigned.json'], ['202', 'desktop-candidate.json']]) {
+          mutateJson(fixture, id, name, value => { value.artifacts.darwin.build_run_id = '100' })
+        }
+      }],
+      ['wrong signer workflow path', fixture => {
+        fixture.github.runs.get('105').path = '.github/workflows/ci.yml'
+      }],
+      ['rerun signer', fixture => { fixture.github.runs.get('105').runAttempt = 2 }],
+      ['failed signer job', fixture => { fixture.github.jobs.get('105')[0].conclusion = 'failure' }],
+      ['duplicate signer job', fixture => { fixture.github.jobs.get('105').push(job('Sign and notarize exact accepted macOS bytes')) }],
+      ['signed artifact from wrong run', fixture => { fixture.github.artifacts.get('208').metadata.runId = '100' }],
+      ['unsigned macOS artifact cannot replace signed output', fixture => { fixture.config.macosSignedArtifactId = '206' }],
+      ['signed artifact ID drift', fixture => { fixture.github.artifacts.get('208').metadata.id = '999' }],
+      ['signed artifact name drift', fixture => { fixture.github.artifacts.get('208').metadata.name = 'other' }],
+      ['signed artifact source drift', fixture => { fixture.github.artifacts.get('208').metadata.sourceCommit = 'b'.repeat(40) }],
+      ['signed artifact API digest drift', fixture => { fixture.github.artifacts.get('208').metadata.digest = `sha256:${'f'.repeat(64)}` }],
+      ['signed artifact archive digest drift', fixture => { fixture.github.artifacts.get('208').bundle.archiveSha256 = 'f'.repeat(64) }],
+      ['extra signed artifact file', fixture => {
+        fixture.github.artifacts.get('208').bundle.files.set('extra.bin', testSource('extra'))
+      }],
+      ['missing signed blockmap', fixture => {
+        fixture.github.artifacts.get('208').bundle.files.delete('e-Mate-2.0.15-mac-universal.dmg.blockmap')
+      }],
+      ['unsafe signed artifact path', fixture => {
+        fixture.github.artifacts.get('208').bundle.files.set('../escape', testSource('extra'))
+      }],
+      ['compressed signed artifact entry', fixture => {
+        fixture.github.artifacts.get('208').bundle.stored.delete('e-Mate-2.0.15-mac-universal.dmg')
+      }],
+      ['signed receipt source drift', fixture => {
+        mutateJson(fixture, '208', 'desktop-macos-signed-receipt.json', value => { value.source_commit = 'b'.repeat(40) })
+      }],
+      ['signed receipt input artifact digest drift', fixture => {
+        mutateJson(fixture, '208', 'desktop-macos-signed-receipt.json', value => { value.input.artifact_api_digest = `sha256:${'f'.repeat(64)}` })
+      }],
+      ['Developer ID team drift', fixture => {
+        mutateJson(fixture, '208', 'desktop-macos-signed-receipt.json', value => { value.developer_id.team_id = 'ZZZZZ99999' })
+      }],
+      ['notary rejection', fixture => {
+        mutateJson(fixture, '208', 'desktop-macos-signed-receipt.json', value => { value.notarization.status = 'Invalid' })
+      }],
+      ['signed output equals unsigned input', fixture => {
+        mutateJson(fixture, '208', 'desktop-macos-signed-receipt.json', value => { value.output.dmg.sha256 = value.input.dmg.sha256 })
+      }],
+      ['signed verification check drift', fixture => {
+        mutateJson(fixture, '208', 'desktop-macos-signed-verification.json', value => { value.checks.stapler_dmg = 'invalid' })
+      }],
+      ['unsigned input artifact archive digest drift', fixture => { fixture.github.artifacts.get('206').bundle.archiveSha256 = 'f'.repeat(64) }],
       ['rerun admission', fixture => { fixture.github.runs.get('101').runAttempt = 2 }],
       ['rerun Desktop build', fixture => { fixture.github.runs.get('102').runAttempt = 2 }],
+      ['old Desktop release job name', fixture => {
+        fixture.github.jobs.set('102', [job('Bind exact protected-main CI artifacts to the release manifest')])
+      }],
       ['extra admission file', fixture => {
         fixture.github.artifacts.get('201').bundle.files.set('extra.json', testSource('{}'))
       }],
@@ -178,41 +246,35 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
         fixture.github.artifacts.get('202').bundle.files.set('extra.bin', testSource('extra'))
       }],
       ['extra staging file', fixture => {
-        fixture.github.artifacts.get('206').bundle.files.set('extra.bin', testSource('extra'))
+        fixture.github.artifacts.get('207').bundle.files.set('extra.bin', testSource('extra'))
       }],
       ['missing staging receipt', fixture => {
-        fixture.github.artifacts.get('206').bundle.files.delete('desktop-artifact-receipt.json')
+        fixture.github.artifacts.get('207').bundle.files.delete('desktop-artifact-receipt.json')
       }],
       ['staging receipt digest drift', fixture => {
-        const receipt = JSON.parse(fixture.github.file('206', 'desktop-artifact-receipt.json').buffer)
+        const receipt = JSON.parse(fixture.github.file('207', 'desktop-artifact-receipt.json').buffer)
         receipt.files[0].sha256 = 'f'.repeat(64)
-        fixture.github.replaceFile('206', 'desktop-artifact-receipt.json', pretty(receipt))
+        fixture.github.replaceFile('207', 'desktop-artifact-receipt.json', pretty(receipt))
       }],
       ['runtime verification run drift', fixture => {
-        const runtime = JSON.parse(fixture.github.file('206', 'desktop-runtime-verification.json').buffer)
+        const runtime = JSON.parse(fixture.github.file('207', 'desktop-runtime-verification.json').buffer)
         runtime.ci_run_id = '99'
-        fixture.github.replaceFile('206', 'desktop-runtime-verification.json', pretty(runtime))
+        fixture.github.replaceFile('207', 'desktop-runtime-verification.json', pretty(runtime))
       }],
       ['mac-smoke staging file', fixture => {
-        fixture.github.artifacts.get('206').bundle.files.set('mac-smoke.dmg', testSource('smoke'))
-      }],
-      ['symlink payload cannot replace exact installer bytes', fixture => {
-        fixture.github.replaceFile('206', 'e-Mate-2.0.14-mac-universal.dmg', Buffer.from('../outside'))
-      }],
-      ['staging artifact name drift', fixture => {
-        fixture.github.artifacts.get('206').metadata.name = 'other'
+        fixture.github.artifacts.get('207').bundle.files.set('mac-smoke.dmg', testSource('smoke'))
       }],
       ['staging artifact run drift', fixture => {
         fixture.github.artifacts.get('207').metadata.runId = '101'
       }],
       ['compressed staging entry', fixture => {
-        fixture.github.artifacts.get('206').bundle.stored.delete('e-Mate-2.0.14-mac-universal.dmg')
+        fixture.github.artifacts.get('207').bundle.stored.delete('e-Mate-2.0.15-win-x64-Setup.exe')
       }],
       ['compressed staging receipt', fixture => {
-        fixture.github.artifacts.get('206').bundle.stored.delete('desktop-artifact-receipt.json')
+        fixture.github.artifacts.get('207').bundle.stored.delete('desktop-artifact-receipt.json')
       }],
       ['final installer bytes drift', fixture => {
-        fixture.github.replaceFile('202', 'e-Mate-2.0.14-win-x64-Setup.exe', Buffer.from('other'))
+        fixture.github.replaceFile('202', 'e-Mate-2.0.15-win-x64-Setup.exe', Buffer.from('other'))
       }],
       ['Base trust-key drift', fixture => {
         const base = JSON.parse(fixture.github.file('201', 'base-contract.json').buffer)
@@ -240,6 +302,11 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
       readFile(new URL('../src/main.mjs', import.meta.url), 'utf8'),
       readFile(new URL('../src/publisher.mjs', import.meta.url), 'utf8'),
     ])
+    assert.match(sources[0], /^  macos-signer-run-id:/mu)
+    assert.match(sources[0], /^  macos-signed-artifact-id:/mu)
+    assert.match(sources[1], /EMATE_MACOS_SIGNER_RUN_ID/u)
+    assert.match(sources[1], /EMATE_MACOS_SIGNED_ARTIFACT_ID/u)
+    assert.doesNotMatch(`${sources[0]}\n${sources[1]}`, /EMATE_MACOS_STAGING_ARTIFACT_ID/u)
     const text = sources.join('\n')
     const forbidden = new RegExp([
       `EMATE_${'R2_'}`, `${'R2'}${'Store'}`, `HttpObject${'Reader'}`, `cloudflare${'storage'}`,
@@ -262,11 +329,11 @@ describe('external Desktop Cloudflare plugin handoff owner', () => {
 
   it('accepts only a ZIP stored entry for the range-stream installer source', () => {
     const listing = [
-      '      19  Stored       19   0% 08-25-2026 00:00 00000000  e-Mate-2.0.14-mac-universal.dmg',
-      '      20  Defl:N       18  10% 08-25-2026 00:00 00000000  e-Mate-2.0.14-win-x64-Setup.exe',
+      '      19  Stored       19   0% 08-25-2026 00:00 00000000  e-Mate-2.0.15-mac-universal.dmg',
+      '      20  Defl:N       18  10% 08-25-2026 00:00 00000000  e-Mate-2.0.15-win-x64-Setup.exe',
     ].join('\n')
     assert.deepEqual([...parseStoredArchiveEntries(listing, DESKTOP_RELEASE_ARTIFACT_FILES.slice(1))], [
-      'e-Mate-2.0.14-mac-universal.dmg',
+      'e-Mate-2.0.15-mac-universal.dmg',
     ])
   })
 })
@@ -275,7 +342,9 @@ function releaseFixture() {
   const keyPair = generateKeyPairSync('ed25519')
   const privateKeyPem = keyPair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString()
   const publicKey = keyPair.publicKey.export({ format: 'der', type: 'spki' }).toString('base64')
-  const mac = Buffer.from('exact-mac-installer')
+  const unsignedMac = Buffer.from('exact-unsigned-mac-installer')
+  const mac = Buffer.from('exact-signed-mac-installer')
+  const blockmap = Buffer.from('exact-signed-blockmap')
   const win = Buffer.from('exact-windows-installer')
   const aggregate = {
     aggregate_sha256: 'e296a56501500b1383041407beeb3421feedf1729f90ff210fb5cc8a7bc63ada',
@@ -288,7 +357,7 @@ function releaseFixture() {
     })),
   }
   const artifacts = {
-    darwin: manifestArtifact('darwin', mac, '100'),
+    darwin: manifestArtifact('darwin', mac, '105'),
     win32: manifestArtifact('win32', win, '100'),
   }
   const candidateBundleSha = '7'.repeat(64)
@@ -311,7 +380,7 @@ function releaseFixture() {
     schema_version: 2,
     document_type: 'emate.desktop-release-manifest',
     release_status: 'admitted',
-    version: '2.0.14',
+    version: '2.0.15',
     source_commit: SOURCE,
     base_contract_id: BASE_ID,
     schedule_protocol_floor: 1,
@@ -323,7 +392,7 @@ function releaseFixture() {
     schema_version: 2,
     document_type: 'emate.desktop-artifact-candidate',
     release_status: 'admission-pending',
-    version: '2.0.14',
+    version: '2.0.15',
     source_commit: SOURCE,
     schedule_protocol_floor: 1,
     artifacts,
@@ -353,6 +422,7 @@ function releaseFixture() {
       public_key_spki_der_base64: publicKey,
     }],
   }
+  const macosCiFiles = stagingFiles('darwin', unsignedMac)
   const github = new FakeGithub({
     source: SOURCE,
     artifacts: [
@@ -362,11 +432,17 @@ function releaseFixture() {
       }),
       artifact('202', `e-mate-desktop-release-${SOURCE}`, '102', candidateBundleSha, {
         'desktop-candidate.json': pretty(candidate),
-        'e-Mate-2.0.14-mac-universal.dmg': mac,
-        'e-Mate-2.0.14-win-x64-Setup.exe': win,
+        'e-Mate-2.0.15-mac-universal.dmg': mac,
+        'e-Mate-2.0.15-win-x64-Setup.exe': win,
       }),
-      artifact('206', `e-mate-desktop-macos-${SOURCE}`, '100', 'a'.repeat(64), stagingFiles('darwin', mac)),
+      artifact('206', `e-mate-desktop-macos-${SOURCE}`, '100', MACOS_CI_ARCHIVE_SHA256, macosCiFiles, MACOS_CI_ARCHIVE_BYTES),
       artifact('207', `e-mate-desktop-windows-${SOURCE}`, '100', 'b'.repeat(64), stagingFiles('win32', win)),
+      artifact('208', `e-mate-desktop-macos-signed-${SOURCE}`, '105', 'c'.repeat(64), signedMacFiles({
+        inputFiles: macosCiFiles,
+        inputDmg: unsignedMac,
+        outputDmg: mac,
+        outputBlockmap: blockmap,
+      })),
     ],
   })
   const config = {
@@ -379,8 +455,9 @@ function releaseFixture() {
     githubSha: SOURCE,
     sourceCommit: SOURCE,
     mainCiRunId: '100',
+    macosSignerRunId: '105',
     admissionArtifactId: '201',
-    macosArtifactId: '206',
+    macosSignedArtifactId: '208',
     windowsArtifactId: '207',
     expectedSignedCurrent: null,
     expectedLegacyCurrent: { bytes: LEGACY_PREDECESSOR.bytes, sha256: LEGACY_PREDECESSOR.sha256 },
@@ -406,9 +483,10 @@ class FakeGithub {
       disabled: false,
     }
     this.runs = new Map([
-      ['100', run('100', '.github/workflows/ci.yml', 'push')],
+      ['100', run('100', '.github/workflows/ci.yml', 'workflow_dispatch')],
       ['101', run('101', '.github/workflows/desktop-admission.yml', 'workflow_dispatch')],
       ['102', run('102', '.github/workflows/desktop-release.yml', 'workflow_dispatch')],
+      ['105', run('105', '.github/workflows/desktop-macos-signing.yml', 'workflow_dispatch')],
     ])
     this.jobs = new Map([
       ['100', [
@@ -417,7 +495,8 @@ class FakeGithub {
         job('macOS universal / unsigned desktop disk image'),
       ]],
       ['101', [job('Desktop release admission')]],
-      ['102', [job('Bind exact protected-main CI artifacts to the release manifest')]],
+      ['102', [job('Bind exact signed macOS and protected-main CI Windows bytes')]],
+      ['105', [job('Sign and notarize exact accepted macOS bytes')]],
     ])
     this.artifacts = new Map(artifacts.map(item => [item.metadata.id, item]))
   }
@@ -431,15 +510,6 @@ class FakeGithub {
   file(id, name) { return this.artifacts.get(String(id)).bundle.files.get(name) }
   replaceFile(id, name, bytes) {
     this.artifacts.get(String(id)).bundle.files.set(name, testSource(bytes))
-  }
-  replaceStagingFiles(id, files) {
-    const bundle = this.artifacts.get(String(id)).bundle
-    bundle.files.clear()
-    bundle.stored.clear()
-    for (const [name, bytes] of Object.entries(files)) {
-      bundle.files.set(name, testSource(bytes))
-      bundle.stored.add(name)
-    }
   }
 }
 
@@ -460,10 +530,18 @@ function job(name) {
   return { name, status: 'completed', conclusion: 'success' }
 }
 
-function artifact(id, name, runId, archiveSha256, files) {
+function artifact(id, name, runId, archiveSha256, files, bytes = Number(id) + 1000) {
   const stored = new Set(Object.keys(files))
   return {
-    metadata: { id, name, runId, digest: `sha256:${archiveSha256}`, expired: false },
+    metadata: {
+      id,
+      name,
+      runId,
+      digest: `sha256:${archiveSha256}`,
+      expired: false,
+      sourceCommit: SOURCE,
+      bytes,
+    },
     bundle: {
       archiveSha256,
       files: new Map(Object.entries(files).map(([path, bytes]) => [path, testSource(bytes)])),
@@ -480,8 +558,8 @@ function testSource(bytes) {
 
 function stagingFiles(platform, installer, blockmap) {
   const installerName = platform === 'darwin'
-    ? 'e-Mate-2.0.14-mac-universal.dmg'
-    : 'e-Mate-2.0.14-win-x64-Setup.exe'
+    ? 'e-Mate-2.0.15-mac-universal.dmg'
+    : 'e-Mate-2.0.15-win-x64-Setup.exe'
   const runtime = pretty({
     schema_version: 1,
     document_type: 'emate.desktop-runtime-verification',
@@ -521,12 +599,83 @@ function stagingFiles(platform, installer, blockmap) {
   }
 }
 
+function signedMacFiles({ inputFiles, inputDmg, outputDmg, outputBlockmap }) {
+  const dmgName = 'e-Mate-2.0.15-mac-universal.dmg'
+  const blockmapName = `${dmgName}.blockmap`
+  const input = fileIdentity(dmgName, inputDmg)
+  const output = fileIdentity(dmgName, outputDmg)
+  return {
+    [dmgName]: outputDmg,
+    [blockmapName]: outputBlockmap,
+    'desktop-macos-signed-receipt.json': pretty({
+      schema_version: 1,
+      document_type: 'emate.desktop-macos-signed-release',
+      source_commit: SOURCE,
+      ci_run_id: '100',
+      base_contract_id: BASE_ID,
+      harness_commit: SOURCE,
+      input: {
+        artifact_id: '206',
+        artifact_name: `e-mate-desktop-macos-${SOURCE}`,
+        artifact_api_digest: `sha256:${MACOS_CI_ARCHIVE_SHA256}`,
+        artifact_archive_bytes: MACOS_CI_ARCHIVE_BYTES,
+        desktop_artifact_receipt: fileIdentity('desktop-artifact-receipt.json', inputFiles['desktop-artifact-receipt.json']),
+        runtime_verification_receipt: fileIdentity('desktop-runtime-verification.json', inputFiles['desktop-runtime-verification.json']),
+        dmg: input,
+        signing: 'adhoc',
+      },
+      output: {
+        dmg: output,
+        blockmap: fileIdentity(blockmapName, outputBlockmap),
+        signing: 'developer-id',
+        notarized: true,
+      },
+      developer_id: {
+        identity: `Developer ID Application: e-Mate (${DEVELOPER_TEAM_ID})`,
+        team_id: DEVELOPER_TEAM_ID,
+        credential_source: 'p12',
+      },
+      notarization: {
+        credential_source: 'api-key',
+        submission_id: '123e4567-e89b-12d3-a456-426614174000',
+        status: 'Accepted',
+      },
+    }),
+    'desktop-macos-signed-verification.json': pretty({
+      schema_version: 1,
+      document_type: 'emate.desktop-macos-signed-verification',
+      source_commit: SOURCE,
+      ci_run_id: '100',
+      input_dmg_sha256: input.sha256,
+      output_dmg_sha256: output.sha256,
+      checks: {
+        codesign_app: 'passed',
+        codesign_dmg: 'passed',
+        gatekeeper_app: 'accepted',
+        gatekeeper_dmg: 'accepted',
+        stapler_dmg: 'valid',
+        verify_mac_release: 'passed',
+      },
+    }),
+  }
+}
+
+function fileIdentity(name, bytes) {
+  return { name, bytes: bytes.byteLength, sha256: sha256(bytes) }
+}
+
+function mutateJson(fixture, artifactId, name, mutate) {
+  const value = JSON.parse(fixture.github.file(artifactId, name).buffer)
+  mutate(value)
+  fixture.github.replaceFile(artifactId, name, pretty(value))
+}
+
 function manifestArtifact(platform, bytes, buildRunId) {
   const filename = platform === 'darwin'
-    ? 'e-Mate-2.0.14-mac-universal.dmg'
-    : 'e-Mate-2.0.14-win-x64-Setup.exe'
+    ? 'e-Mate-2.0.15-mac-universal.dmg'
+    : 'e-Mate-2.0.15-win-x64-Setup.exe'
   return {
-    url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.14/${SOURCE}/${filename}`,
+    url: `${PUBLIC_ORIGIN}/desktop/releases/v2.0.15/${SOURCE}/${filename}`,
     bytes: bytes.byteLength,
     sha256: sha256(bytes),
     build_source_commit: SOURCE,

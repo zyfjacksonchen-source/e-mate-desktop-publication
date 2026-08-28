@@ -1,11 +1,14 @@
 name: e-Mate protected performance aggregate admission
-description: Verify four exact protected-main e-Mate 2.0.13 TTFT v2 evidence artifacts and sign one closed aggregate.
+description: Verify four exact protected-main e-Mate 2.0.15 TTFT v2 evidence artifacts and sign one closed aggregate.
 inputs:
   source-sha:
     description: Exact protected-main source commit bound by CI, the Desktop build, and TTFT evidence.
     required: true
   main-ci-run-id:
-    description: Successful protected-main ci.yml push run containing CI admission.
+    description: Successful attempt-1 protected-main formal RC ci.yml workflow_dispatch run containing CI admission and both platform jobs.
+    required: true
+  macos-signer-run-id:
+    description: Exact successful attempt-1 protected-main desktop-macos-signing.yml workflow_dispatch run owning the candidate macOS bytes.
     required: true
   desktop-artifact-id:
     description: Exact three-file e-mate-desktop-release artifact containing the candidate and installer bytes.
@@ -58,6 +61,7 @@ runs:
         EMATE_ACTION_REF: ${{ github.action_ref }}
         EMATE_SOURCE_SHA: ${{ inputs.source-sha }}
         EMATE_MAIN_CI_RUN_ID: ${{ inputs.main-ci-run-id }}
+        EMATE_MACOS_SIGNER_RUN_ID: ${{ inputs.macos-signer-run-id }}
         EMATE_DESKTOP_ARTIFACT_ID: ${{ inputs.desktop-artifact-id }}
         EMATE_PROFILE_RELEASE_RUN_ID: ${{ inputs.profile-release-run-id }}
         EMATE_PROFILE_RELEASE_ARTIFACT_ID: ${{ inputs.profile-artifact-id }}

@@ -11,10 +11,12 @@ const MAX_AUTH_WINDOW_MS = 15 * 60 * 1000
 const MAX_TRANSFER_MS = 10 * 60 * 1000
 const IMMUTABLE_CACHE = 'public,max-age=31536000,immutable'
 const BINARY_CONTENT_TYPE = 'application/octet-stream'
+const MACOS_SIGNED_RECEIPT = 'desktop-macos-signed-receipt.json'
+const MACOS_SIGNED_VERIFICATION = 'desktop-macos-signed-verification.json'
 const TOKEN = /^[A-Za-z0-9_-]{43}$/u
 const SHA256 = /^[0-9a-f]{64}$/u
 const ARTIFACT_DIGEST = /^sha256:([0-9a-f]{64})$/u
-const RELEASE_KEY = /^desktop\/releases\/v2\.0\.14\/([0-9a-f]{40})\/(e-Mate-2\.0\.14-(?:mac-universal\.dmg|win-x64-Setup\.exe))$/u
+const RELEASE_KEY = /^desktop\/releases\/v2\.0\.15\/([0-9a-f]{40})\/(e-Mate-2\.0\.15-(?:mac-universal\.dmg|win-x64-Setup\.exe))$/u
 const GITHUB_BLOB_HOST = /^productionresultssa[0-9]+\.blob\.core\.windows\.net$/u
 const ALLOWED_ZIP_FLAGS = (1 << 3) | (1 << 11)
 
@@ -208,14 +210,13 @@ function expectedArchiveEntries(value, artifactPath, installerBytes) {
   } catch {
     return null
   }
-  if (!Array.isArray(entries) || ![3, 4].includes(entries.length)) return null
+  const signedMac = typeof artifactPath === 'string' && artifactPath.endsWith('-mac-universal.dmg')
+  if (!Array.isArray(entries) || (signedMac ? entries.length !== 4 : ![3, 4].includes(entries.length))) return null
   const names = entries.map(entry => entry?.name)
-  const allowed = [
-    'desktop-artifact-receipt.json',
-    'desktop-runtime-verification.json',
-    artifactPath,
-  ]
-  if (entries.length === 4) allowed.push(`${artifactPath}.blockmap`)
+  const allowed = signedMac
+    ? [MACOS_SIGNED_RECEIPT, MACOS_SIGNED_VERIFICATION, artifactPath, `${artifactPath}.blockmap`]
+    : ['desktop-artifact-receipt.json', 'desktop-runtime-verification.json', artifactPath]
+  if (!signedMac && entries.length === 4) allowed.push(`${artifactPath}.blockmap`)
   if (JSON.stringify(names) !== JSON.stringify([...allowed].sort())) return null
   if (new Set(names).size !== names.length || entries.some(entry => !hasExactKeys(entry, ['name', 'bytes'])
     || !safeArchiveName(entry.name) || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0)) return null
