@@ -32,6 +32,7 @@ async function main() {
       githubSha: requiredEnv('GITHUB_SHA'),
       sourceCommit: requiredEnv('EMATE_SOURCE_SHA'),
       mainCiRunId: requiredEnv('EMATE_MAIN_CI_RUN_ID'),
+      macosSignerRunId: requiredEnv('EMATE_MACOS_SIGNER_RUN_ID'),
       currentRunId: requiredEnv('GITHUB_RUN_ID'),
       currentRunAttempt: requiredEnv('GITHUB_RUN_ATTEMPT'),
       desktopArtifactId: requiredEnv('EMATE_DESKTOP_ARTIFACT_ID'),

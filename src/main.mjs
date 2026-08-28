@@ -49,8 +49,9 @@ async function main() {
       githubSha: requiredEnv('GITHUB_SHA'),
       sourceCommit: requiredEnv('EMATE_SOURCE_SHA'),
       mainCiRunId: requiredEnv('EMATE_MAIN_CI_RUN_ID'),
+      macosSignerRunId: requiredEnv('EMATE_MACOS_SIGNER_RUN_ID'),
       admissionArtifactId: requiredEnv('EMATE_ADMISSION_ARTIFACT_ID'),
-      macosArtifactId: requiredEnv('EMATE_MACOS_STAGING_ARTIFACT_ID'),
+      macosSignedArtifactId: requiredEnv('EMATE_MACOS_SIGNED_ARTIFACT_ID'),
       windowsArtifactId: requiredEnv('EMATE_WINDOWS_STAGING_ARTIFACT_ID'),
       expectedSignedCurrent: parseExpectedCurrent(requiredEnv('EMATE_EXPECTED_SIGNED_CURRENT')),
       expectedLegacyCurrent: parseExpectedCurrent(requiredEnv('EMATE_EXPECTED_LEGACY_CURRENT')),
@@ -154,6 +155,8 @@ export class GithubClient {
       digest: value.digest,
       expired: value.expired,
       runId: value.workflow_run?.id,
+      sourceCommit: value.workflow_run?.head_sha,
+      bytes: value.size_in_bytes,
     }
   }
 

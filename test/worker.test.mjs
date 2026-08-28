@@ -8,8 +8,8 @@ const NOW = 1_787_680_000_000
 const SOURCE = 'a'.repeat(40)
 const PLAN = 'b'.repeat(64)
 const TOKEN = 'A'.repeat(43)
-const ARTIFACT = 'e-Mate-2.0.14-mac-universal.dmg'
-const KEY = `desktop/releases/v2.0.14/${SOURCE}/${ARTIFACT}`
+const ARTIFACT = 'e-Mate-2.0.15-mac-universal.dmg'
+const KEY = `desktop/releases/v2.0.15/${SOURCE}/${ARTIFACT}`
 const ORIGIN = 'https://productionresultssa0.blob.core.windows.net'
 const SOURCE_PATH = '/actions-results/unit/staging.zip'
 const SOURCE_URL = `${ORIGIN}${SOURCE_PATH}?sig=short-lived`
@@ -51,13 +51,21 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
     assert.deepEqual(fixture.bucket.bytes(KEY), fixture.file)
   })
 
-  it('accepts the exact four-entry closure with an optional blockmap', async () => {
-    const fixture = makeFixture({ token: 'C'.repeat(43), blockmap: true })
+  it('accepts the exact mandatory four-entry signed macOS closure', async () => {
+    const fixture = makeFixture({ token: 'C'.repeat(43) })
     const response = await fixture.call()
     assert.equal(response.status, 200)
     assert.equal((await response.json()).status, 'uploaded')
     assert.equal(JSON.parse(fixture.env.EXPECTED_ARCHIVE_ENTRIES).length, 4)
     assert.equal([...fixture.bucket.objects.keys()].some(key => key.includes('/tmp/')), false)
+  })
+
+  it('keeps the existing formal-CI Windows archive closure', async () => {
+    const fixture = makeFixture({ token: 'D'.repeat(43), windows: true })
+    const response = await fixture.call()
+    assert.equal(response.status, 200)
+    assert.equal((await response.json()).status, 'uploaded')
+    assert.deepEqual(fixture.bucket.bytes(fixture.env.EXPECTED_KEY), fixture.file)
   })
 
   it('fails before the first write for auth, source, plan, pointer, or size drift', async t => {
@@ -75,6 +83,14 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
       }, 503, 'configuration-invalid'],
       ['archive entry contract drift', fixture => {
         fixture.env.EXPECTED_ARCHIVE_ENTRIES = '[]'
+        return fixture.request()
+      }, 503, 'configuration-invalid'],
+      ['unsigned macOS CI closure cannot be a final darwin source', fixture => {
+        fixture.env.EXPECTED_ARCHIVE_ENTRIES = JSON.stringify([
+          { name: 'desktop-artifact-receipt.json', bytes: 1 },
+          { name: 'desktop-runtime-verification.json', bytes: 1 },
+          { name: ARTIFACT, bytes: fixture.file.byteLength },
+        ].sort((left, right) => left.name.localeCompare(right.name)))
         return fixture.request()
       }, 503, 'configuration-invalid'],
     ]
@@ -125,6 +141,9 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
           fixture.archiveEntries[1],
           { name: 'unexpected.json', data: fixture.archiveEntries[2].data },
         ]))
+      }, 422, 'archive-shape-invalid'],
+      ['missing signed entry', fixture => {
+        fixture.replaceArchive(storedZipEntries(fixture.archiveEntries.slice(0, -1)))
       }, 422, 'archive-shape-invalid'],
       ['different existing final', fixture => {
         fixture.bucket.seed(KEY, new TextEncoder().encode('wrong'), objectMetadata(fixture.env))
@@ -213,13 +232,21 @@ describe('short-lived Cloudflare large-object publication bridge', () => {
 
 function makeFixture(options = {}) {
   const token = options.token ?? TOKEN
+  const artifact = options.windows ? 'e-Mate-2.0.15-win-x64-Setup.exe' : ARTIFACT
+  const key = `desktop/releases/v2.0.15/${SOURCE}/${artifact}`
   const file = new TextEncoder().encode('exact installer bytes for a streaming fixture')
-  const archiveEntries = [
-    { name: ARTIFACT, data: file },
-    { name: 'desktop-runtime-verification.json', data: new TextEncoder().encode('{"runtime":true}\n') },
-    { name: 'desktop-artifact-receipt.json', data: new TextEncoder().encode('{"receipt":true}\n') },
-    ...(options.blockmap ? [{ name: `${ARTIFACT}.blockmap`, data: new TextEncoder().encode('exact blockmap') }] : []),
-  ]
+  const archiveEntries = options.windows
+    ? [
+        { name: artifact, data: file },
+        { name: 'desktop-runtime-verification.json', data: new TextEncoder().encode('{"runtime":true}\n') },
+        { name: 'desktop-artifact-receipt.json', data: new TextEncoder().encode('{"receipt":true}\n') },
+      ]
+    : [
+        { name: artifact, data: file },
+        { name: `${artifact}.blockmap`, data: new TextEncoder().encode('exact blockmap') },
+        { name: 'desktop-macos-signed-receipt.json', data: new TextEncoder().encode('{"receipt":true}\n') },
+        { name: 'desktop-macos-signed-verification.json', data: new TextEncoder().encode('{"verification":true}\n') },
+      ]
   let archive = storedZipEntries(archiveEntries)
   let source = artifactSource(archive)
   const bucket = new MemoryR2()
@@ -227,8 +254,8 @@ function makeFixture(options = {}) {
     RELEASES: bucket,
     AUTH_TOKEN: token,
     EXPECTED_BUCKET: 'emate-desktop-downloads',
-    EXPECTED_KEY: KEY,
-    EXPECTED_ARTIFACT_PATH: ARTIFACT,
+    EXPECTED_KEY: key,
+    EXPECTED_ARTIFACT_PATH: artifact,
     EXPECTED_BYTES: String(file.byteLength),
     EXPECTED_SHA256: sha256(file),
     EXPECTED_GITHUB_ARTIFACT_DIGEST: `sha256:${sha256(archive)}`,

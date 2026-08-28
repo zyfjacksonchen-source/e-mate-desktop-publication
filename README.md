@@ -14,7 +14,7 @@ status is only `ready-for-cloudflare-plugin`.
 Both actions are deliberately pinned to:
 
 - caller repository `zyfjacksonchen-source/e-Mate-2.0.11`;
-- release `2.0.14`;
+- release `2.0.15`;
 - protected branch `main` with strict required check `CI admission`, administrator enforcement, linear history, and no force-push or deletion;
 - public origin `https://pub-ada3f610c0234a76838f4e19fe2bb25e.r2.dev`;
 - bucket `emate-desktop-downloads`;
@@ -33,9 +33,10 @@ Inputs:
 | Input | Contract |
 | --- | --- |
 | `source-sha` | Current protected `main`, shared by every admitted run and artifact |
-| `main-ci-run-id` | Successful attempt-1 `.github/workflows/ci.yml` push run with `CI admission` |
+| `main-ci-run-id` | Successful attempt-1 formal RC `.github/workflows/ci.yml` `workflow_dispatch` run with `CI admission` and both platform jobs |
+| `macos-signer-run-id` | Exact successful attempt-1 `.github/workflows/desktop-macos-signing.yml` run with the unique signer job |
 | `admission-artifact-id` | Exact attempt-1 `e-mate-desktop-admission-<sha>` artifact |
-| `macos-artifact-id` | Exact closed `e-mate-desktop-macos-<sha>` staging artifact from the admitted CI run |
+| `macos-signed-artifact-id` | Exact closed `e-mate-desktop-macos-signed-<sha>` artifact from the signer run |
 | `windows-artifact-id` | Exact closed `e-mate-desktop-windows-<sha>` staging artifact from the admitted CI run |
 | `expected-signed-current` | Literal `absent`, or exact `<bytes>:<sha256>` for the plugin to recheck before activation |
 | `expected-legacy-current` | Exact approved `desktop/latest.json` predecessor `<bytes>:<sha256>` for the final bridge CAS; only the frozen final 2.0.13 signed manifest identity is accepted |
@@ -48,16 +49,23 @@ base-contract.json
 desktop-release-unsigned.json
 ```
 
-The unsigned manifest binds the final three-file Desktop artifact. The action verifies its GitHub API ID, name, archive
-digest, run, attempt, workflow, branch, source commit, required jobs, exact file
-set, installer byte count, and installer SHA-256. `mac-smoke`, extra files,
-path traversal, old attempts, or a different protected-main source fail closed.
+The unsigned manifest binds the final three-file Desktop artifact with darwin
+owned by the exact signer run and win32 owned by the exact formal CI run. The
+candidate artifact remains owned by `.github/workflows/desktop-release.yml`.
+The action verifies every GitHub API ID, name, archive digest, run, attempt,
+workflow, branch, source commit, required job, file set, byte count, and SHA-256.
+`mac-smoke`, extra files, path traversal, old attempts, or another source fail closed.
 
-The macOS and Windows staging artifacts each contain the installer, runtime
-verification receipt, artifact receipt, and optional blockmap as ZIP `Stored`
-entries (upload compression level 0). They are independently downloaded and
-compared with the same installer in the final three-file candidate. The plan
-binds each staging source with:
+The signed macOS artifact contains exactly the final DMG, blockmap, signed
+receipt, and verification receipt as ZIP `Stored` entries. The action
+independently rechecks Developer ID identity/team, notarization `Accepted`,
+codesign, Gatekeeper, stapling, output-versus-input identity, Base/Harness, and
+all receipt bytes. It then follows the receipt's input artifact ID back to the
+formal CI `e-mate-desktop-macos-<sha>` artifact, downloads it, and revalidates
+its API digest/archive bytes, CI/runtime receipts, and input DMG. That unsigned
+artifact is signer input only and is never an immutable publication object.
+Windows continues through the existing exact CI staging validator. The plan
+binds the signed macOS and formal-CI Windows sources with:
 
 ```text
 github_artifact_id
@@ -98,11 +106,11 @@ the public key already present in the admitted Base.
 `cloudflare-publication-plan.json` has a closed schema. It records:
 
 - status `ready-for-cloudflare-plugin` and authority `codex-cloudflare-plugin`;
-- exact repository, source, bucket, public origin, CI/admission/candidate/staging artifact IDs;
+- exact repository, source, bucket, public origin, formal CI/signer/admission/candidate/signed-macOS/Windows artifact IDs;
 - signed-manifest identity, bytes, SHA-256, Base, schedule protocol, and key ID;
 - macOS installer, Windows installer, and manual signed manifest as immutable objects;
 - `desktop/signed/latest.json` as the Base v7 active pointer, with exact expected current and `no-store`;
-- `desktop/latest.json` as the one corrective bootstrap pointer, CAS-bound to the exact frozen final 2.0.13 manifest and changed last to the same 2.0.14 signed manifest bytes.
+- `desktop/latest.json` as the one corrective bootstrap pointer, CAS-bound to the exact frozen final 2.0.13 manifest and changed last to the same 2.0.15 signed manifest bytes.
 
 The manual immutable manifest and both active pointers reference the same
 `desktop-release-signed.json` bytes and SHA-256. The signed bytes are also
@@ -130,9 +138,11 @@ The independent entrypoint is:
 zyfjacksonchen-source/e-mate-desktop-publication/performance@<40-character-commit>
 ```
 
-It accepts exact IDs for the protected-main CI run, final three-file Desktop
-artifact, Profile release run/artifact, four named current-run evidence
-artifacts, and Base signing key. It accepts no caller filesystem path. The
+It accepts exact trusted IDs for the protected-main formal CI run, macOS signer
+run, final three-file Desktop artifact, Profile release run/artifact, four named
+current-run evidence artifacts, and Base signing key. Candidate darwin must bind
+the signer run and win32 must bind formal CI; candidate self-reporting never
+replaces either trusted input. It accepts no caller filesystem path. The
 ordered roster is fixed to:
 
 1. `ecorex-chat` / `e-mate-enterprise` / `gpt-5.6-luna` / `max`

@@ -1,17 +1,20 @@
 name: e-Mate Desktop Cloudflare plugin handoff
-description: Verify one admitted e-Mate 2.0.14 Desktop release, sign it, then emit a byte-bound Codex Cloudflare plugin publication plan without accessing R2.
+description: Verify one admitted e-Mate 2.0.15 Desktop release with exact signed macOS bytes, sign its manifest, then emit a byte-bound Codex Cloudflare plugin publication plan without accessing R2.
 inputs:
   source-sha:
     description: Exact protected-main source commit bound by CI and every release artifact.
     required: true
   main-ci-run-id:
-    description: Successful attempt-1 protected-main CI run containing CI admission.
+    description: Successful attempt-1 protected-main formal RC ci.yml workflow_dispatch run containing CI admission and both platform jobs.
+    required: true
+  macos-signer-run-id:
+    description: Exact successful attempt-1 protected-main desktop-macos-signing.yml workflow_dispatch run.
     required: true
   admission-artifact-id:
     description: Successful attempt-1 protected-main desktop-admission artifact containing only the unsigned manifest and Base contract.
     required: true
-  macos-artifact-id:
-    description: Exact closed compression-level-0 e-mate-desktop-macos-<sha> staging artifact from the admitted CI run.
+  macos-signed-artifact-id:
+    description: Exact closed compression-level-0 e-mate-desktop-macos-signed-<sha> artifact from the exact signer run.
     required: true
   windows-artifact-id:
     description: Exact closed compression-level-0 e-mate-desktop-windows-<sha> staging artifact from the admitted CI run.
@@ -64,8 +67,9 @@ runs:
         EMATE_ACTION_REF: ${{ github.action_ref }}
         EMATE_SOURCE_SHA: ${{ inputs.source-sha }}
         EMATE_MAIN_CI_RUN_ID: ${{ inputs.main-ci-run-id }}
+        EMATE_MACOS_SIGNER_RUN_ID: ${{ inputs.macos-signer-run-id }}
         EMATE_ADMISSION_ARTIFACT_ID: ${{ inputs.admission-artifact-id }}
-        EMATE_MACOS_STAGING_ARTIFACT_ID: ${{ inputs.macos-artifact-id }}
+        EMATE_MACOS_SIGNED_ARTIFACT_ID: ${{ inputs.macos-signed-artifact-id }}
         EMATE_WINDOWS_STAGING_ARTIFACT_ID: ${{ inputs.windows-artifact-id }}
         EMATE_EXPECTED_SIGNED_CURRENT: ${{ inputs.expected-signed-current }}
         EMATE_EXPECTED_LEGACY_CURRENT: ${{ inputs.expected-legacy-current }}
