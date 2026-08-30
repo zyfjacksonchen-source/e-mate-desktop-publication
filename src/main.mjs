@@ -83,7 +83,7 @@ async function main() {
   }
 }
 
-async function materializeOutputFiles(files, root) {
+export async function materializeOutputFiles(files, root) {
   validateArchiveEntries([...files.keys()])
   for (const [path, source] of files) {
     if (source.bytes <= 0 || source.bytes > MAX_API_BYTES) {

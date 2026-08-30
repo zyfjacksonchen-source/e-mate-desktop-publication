@@ -1,0 +1,102 @@
+name: e-Mate local schema-2 signer
+description: Verify one exact local-flow release and emit its schema-2 signer handoff without building, testing, publishing, or accessing R2.
+inputs:
+  source-sha:
+    description: Exact protected-main source commit bound by the local-flow run and compatibility carrier.
+    required: true
+  run-root:
+    description: Safely expanded absolute local-flow run directory.
+    required: true
+  immutable-request-path:
+    description: Canonical immutable publication request path inside run-root.
+    required: true
+  immutable-request-sha256:
+    description: SHA-256 of the exact immutable publication request bytes.
+    required: true
+  immutable-receipt-path:
+    description: Canonical immutable publication receipt path inside run-root.
+    required: true
+  immutable-receipt-sha256:
+    description: SHA-256 of the exact immutable publication receipt bytes.
+    required: true
+  compatibility-request-path:
+    description: Canonical compatibility attestation request path inside run-root.
+    required: true
+  compatibility-request-sha256:
+    description: SHA-256 of the exact compatibility attestation request bytes.
+    required: true
+  profile-aggregate-path:
+    description: Canonical Profile component aggregate path inside run-root.
+    required: true
+  profile-aggregate-sha256:
+    description: SHA-256 of the exact Profile component aggregate bytes.
+    required: true
+  compatibility-run-id:
+    description: Exact successful attempt-1 compatibility carrier workflow run ID.
+    required: true
+  compatibility-artifact-id:
+    description: Exact three-file compatibility carrier artifact ID.
+    required: true
+  signing-key-id:
+    description: Existing Base profile_signing_keys identity for the schema-2 Desktop signature.
+    required: true
+outputs:
+  artifact-path:
+    description: Action-owned directory containing exactly the three schema-2 signer files.
+    value: ${{ steps.sign.outputs.artifact_path }}
+  artifact-name:
+    description: Exact signer handoff artifact name.
+    value: ${{ steps.sign.outputs.artifact_name }}
+  signed-manifest-path:
+    description: Local path to desktop-release-signed.json.
+    value: ${{ steps.sign.outputs.signed_manifest_path }}
+  publication-plan-path:
+    description: Local path to cloudflare-publication-plan.json.
+    value: ${{ steps.sign.outputs.publication_plan_path }}
+  signer-handoff-path:
+    description: Local path to cloudflare-plugin-handoff.json.
+    value: ${{ steps.sign.outputs.signer_handoff_path }}
+  manifest-sha256:
+    description: SHA-256 of the exact signed manifest bytes.
+    value: ${{ steps.sign.outputs.manifest_sha256 }}
+  publication-plan-sha256:
+    description: SHA-256 of the exact publication plan bytes.
+    value: ${{ steps.sign.outputs.publication_plan_sha256 }}
+  signer-handoff-sha256:
+    description: SHA-256 of the exact signer receipt bytes.
+    value: ${{ steps.sign.outputs.signer_handoff_sha256 }}
+  status:
+    description: ready-for-main-local-flow-activation after successful preparation; never a publication claim.
+    value: ${{ steps.sign.outputs.status }}
+runs:
+  using: composite
+  steps:
+    - id: sign
+      name: Verify and sign the exact local schema-2 handoff
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        EMATE_PROFILE_SIGNING_PRIVATE_KEY: ${{ env.EMATE_PROFILE_SIGNING_PRIVATE_KEY }}
+        EMATE_ACTION_REPOSITORY: ${{ github.action_repository }}
+        EMATE_ACTION_REF: ${{ github.action_ref }}
+        EMATE_SOURCE_SHA: ${{ inputs.source-sha }}
+        EMATE_RUN_ROOT: ${{ inputs.run-root }}
+        EMATE_IMMUTABLE_REQUEST_PATH: ${{ inputs.immutable-request-path }}
+        EMATE_IMMUTABLE_REQUEST_SHA256: ${{ inputs.immutable-request-sha256 }}
+        EMATE_IMMUTABLE_RECEIPT_PATH: ${{ inputs.immutable-receipt-path }}
+        EMATE_IMMUTABLE_RECEIPT_SHA256: ${{ inputs.immutable-receipt-sha256 }}
+        EMATE_COMPATIBILITY_REQUEST_PATH: ${{ inputs.compatibility-request-path }}
+        EMATE_COMPATIBILITY_REQUEST_SHA256: ${{ inputs.compatibility-request-sha256 }}
+        EMATE_PROFILE_AGGREGATE_PATH: ${{ inputs.profile-aggregate-path }}
+        EMATE_PROFILE_AGGREGATE_SHA256: ${{ inputs.profile-aggregate-sha256 }}
+        EMATE_COMPATIBILITY_RUN_ID: ${{ inputs.compatibility-run-id }}
+        EMATE_COMPATIBILITY_ARTIFACT_ID: ${{ inputs.compatibility-artifact-id }}
+        EMATE_SIGNING_KEY_ID: ${{ inputs.signing-key-id }}
+      run: |
+        set -euo pipefail
+        test "$(node -p 'process.versions.node.split(".")[0]')" = 24
+        action_root="$(realpath "$GITHUB_ACTION_PATH/..")"
+        entry="$(realpath "$action_root/src/local-schema2-main.mjs")"
+        test "$entry" = "$action_root/src/local-schema2-main.mjs"
+        test -f "$entry"
+        node "$entry"
