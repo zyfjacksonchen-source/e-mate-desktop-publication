@@ -5,6 +5,9 @@ import {
   sign,
   verify,
 } from 'node:crypto'
+import { createReadStream } from 'node:fs'
+import { lstat, readFile, realpath } from 'node:fs/promises'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 
 export const EXPECTED_REPOSITORY = 'zyfjacksonchen-source/e-Mate-2.0.11'
 export const EXPECTED_ACTION_REPOSITORY = 'zyfjacksonchen-source/e-mate-desktop-publication'
@@ -41,6 +44,8 @@ export const LEGACY_PREDECESSOR = Object.freeze({
 const SHA256 = /^[0-9a-f]{64}$/u
 const SHA40 = /^[0-9a-f]{40}$/u
 const RUN_ID = /^[1-9][0-9]*$/u
+const LOCAL_RUN_ID = /^\d{8}T\d{6}Z-[0-9a-f]{12}-[0-9a-f]{6}$/u
+const ETAG = /^[0-9a-f]{32}$/u
 const TEAM_ID = /^[A-Z0-9]{10}$/u
 const NOTARY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
 const BASE_ID = /^e-mate-desktop-profile-v[1-9][0-9]*-dsh-[0-9a-f]{12}$/u
@@ -75,6 +80,8 @@ const LEGACY_MANIFEST_MAX_BYTES = 16 * 1024
 const IMMUTABLE_CACHE = 'public,max-age=31536000,immutable'
 const JSON_CONTENT_TYPE = 'application/json'
 const BINARY_CONTENT_TYPE = 'application/octet-stream'
+const LOCAL_OWNER = 'existing-desktop-manifest-admission-signing-owner+codex-cloudflare-plugin'
+const LOCAL_REQUEST_MAX_BYTES = 1024 * 1024
 const PERFORMANCE_PATHS = ['baseline', 'emate_online', 'emate_enterprise_unavailable_valid_cache']
 const PERFORMANCE_ARTIFACT_FIELDS = [
   ['raw_samples_artifact', 'raw-samples'],
@@ -342,6 +349,72 @@ export async function createPerformanceAdmission(config, dependencies) {
     performanceRunId: evidence.performance_run_id,
     admissionSha256: sha256(admissionBytes),
     evidenceSha256: unsigned.evidence_sha256,
+  }
+}
+
+/**
+ * Admit the exact local-flow request and installer bytes without signing them.
+ * The current Desktop manifest contract still requires GitHub provenance, so
+ * this boundary deliberately stops before manifest construction.
+ */
+export async function admitLocalDesktopCandidate(config) {
+  if (process.versions.node.split('.')[0] !== '24') throw new Error('local candidate admission requires Node 24')
+  if (!hasExactKeys(config, [
+    'runRoot', 'requestPath', 'requestSha256', 'artifacts',
+  ]) || !SHA256.test(config.requestSha256 ?? '') || !hasExactKeys(config.artifacts, ['darwin', 'win32'])) {
+    throw new Error('local candidate admission bindings are invalid')
+  }
+
+  const runRoot = await exactLocalDirectory(config.runRoot, 'local-flow run root')
+  const requestPath = await exactLocalFile(
+    config.requestPath,
+    resolve(runRoot, 'publication', 'cloudflare-owner-request.json'),
+    runRoot,
+    'local-flow publication request',
+  )
+  const requestBytes = await readStableLocalFile(requestPath, LOCAL_REQUEST_MAX_BYTES, 'local-flow publication request')
+  if (sha256(requestBytes) !== config.requestSha256) throw new Error('local-flow publication request SHA-256 drifted')
+  const request = parsePrettyJson(requestBytes, 'local-flow publication request')
+  const requestAdmission = validateLocalPublicationRequest(request)
+
+  const admittedFiles = new Map()
+  for (const descriptor of request.immutable_objects) {
+    const path = await exactLocalFile(
+      resolve(runRoot, descriptor.artifact_path),
+      resolve(runRoot, descriptor.artifact_path),
+      runRoot,
+      `${descriptor.platform} immutable artifact`,
+    )
+    const identity = await stableLocalFileIdentity(path, `${descriptor.platform} immutable artifact`)
+    if (identity.bytes !== descriptor.bytes || identity.sha256 !== descriptor.sha256) {
+      throw new Error(`${descriptor.platform} immutable artifact bytes do not match the local-flow request`)
+    }
+    admittedFiles.set(descriptor.artifact_path, { path, ...identity })
+  }
+
+  const artifacts = {}
+  for (const [manifestPlatform, requestPlatform] of [['darwin', 'macos'], ['win32', 'windows']]) {
+    const descriptor = requestAdmission.primaryArtifacts[requestPlatform]
+    const admitted = admittedFiles.get(descriptor.artifact_path)
+    const path = await exactLocalFile(
+      config.artifacts[manifestPlatform], admitted.path, runRoot, `${manifestPlatform} installer`,
+    )
+    artifacts[manifestPlatform] = { path, bytes: admitted.bytes, sha256: admitted.sha256 }
+  }
+
+  return {
+    status: 'awaiting-manifest-input-and-client-compatible-provenance',
+    request: {
+      path: requestPath,
+      sha256: config.requestSha256,
+      run_id: request.run_id,
+      version: request.version,
+      source_commit: request.source_commit,
+      transaction_mode: request.transaction_plan.mode,
+      current_public_pointers: request.transaction_plan.current_public_pointers,
+    },
+    artifacts,
+    handoff_files: [...request.manifest_admission_and_signing.handoff.exact_files],
   }
 }
 
@@ -636,6 +709,271 @@ export async function prepareDesktopPublication(config, dependencies) {
     manifestSha256: signedRawSha256,
     planSha256: sha256(publicationPlanBytes),
   }
+}
+
+function validateLocalPublicationRequest(request) {
+  const topLevel = [
+    'schema_version', 'document_type', 'operation', 'mode', 'status', 'authority', 'distribution_origin',
+    'run_id', 'version', 'source_commit', 'transaction_plan', 'rebuild', 'macos_publication_mode',
+    'installer_security', 'immutable_objects', 'manifest_admission_and_signing',
+    'publication_and_activation', 'delete_objects',
+  ]
+  if (!hasExactKeys(request, topLevel) || request.schema_version !== 1
+    || request.document_type !== 'emate.local-cloudflare-owner-request' || request.operation !== 'publish'
+    || request.mode !== 'apply' || request.status !== 'ready-for-existing-owner' || request.authority !== LOCAL_OWNER
+    || request.distribution_origin !== PUBLIC_ORIGIN || !LOCAL_RUN_ID.test(request.run_id ?? '')
+    || !/^\d+\.\d+\.\d+$/u.test(request.version ?? '') || !SHA40.test(request.source_commit ?? '')
+    || request.run_id.split('-')[1] !== request.source_commit.slice(0, 12)
+    || request.rebuild !== false || request.macos_publication_mode !== 'unsigned'
+    || !hasExactKeys(request.installer_security, ['darwin', 'win32'])
+    || !['darwin', 'win32'].every(platform => hasExactKeys(request.installer_security[platform], ['code_signed', 'notarized'])
+      && request.installer_security[platform].code_signed === false
+      && request.installer_security[platform].notarized === false)
+    || !Array.isArray(request.immutable_objects) || !Array.isArray(request.delete_objects)
+    || request.delete_objects.length !== 0 || hasLocalGithubMetadata(request)) {
+    throw new Error('local-flow publication request contract is invalid')
+  }
+
+  validateLocalTransactionPlan(request.transaction_plan, request)
+  validateLocalManifestRequest(request.manifest_admission_and_signing)
+  validateLocalActivationRequest(request.publication_and_activation, request.transaction_plan)
+  const primaryArtifacts = validateLocalImmutableObjects(request.immutable_objects, request)
+  return { primaryArtifacts }
+}
+
+function validateLocalTransactionPlan(transaction, request) {
+  if (!hasExactKeys(transaction, [
+    'schema_version', 'mode', 'distribution_origin', 'run_id', 'product_version', 'source_commit',
+    'current_public_version', 'current_public_source_commit', 'current_public_pointers', 'manual_manifest',
+    'activation_order', 'rollback_order', 'manual_reinstall_required_for_existing_2_0_15',
+  ]) || transaction.schema_version !== 1
+    || !['new-version', 'same-version-2.0.15-exception'].includes(transaction.mode)
+    || transaction.distribution_origin !== PUBLIC_ORIGIN || transaction.run_id !== request.run_id
+    || transaction.product_version !== request.version || transaction.source_commit !== request.source_commit
+    || !/^\d+\.\d+\.\d+$/u.test(transaction.current_public_version ?? '')
+    || !SHA40.test(transaction.current_public_source_commit ?? '')
+    || !hasExactKeys(transaction.current_public_pointers, ['signed', 'legacy', 'manual'])
+    || !hasExactKeys(transaction.manual_manifest, ['key', 'write', 'rollback'])
+    || !Array.isArray(transaction.activation_order) || !Array.isArray(transaction.rollback_order)) {
+    throw new Error('local-flow release transaction plan is invalid')
+  }
+  const expectedPointerKeys = {
+    signed: 'desktop/signed/latest.json',
+    legacy: 'desktop/latest.json',
+    manual: `desktop/manual/v${transaction.current_public_version}/latest.json`,
+  }
+  for (const [name, key] of Object.entries(expectedPointerKeys)) {
+    const pointer = transaction.current_public_pointers[name]
+    if (!hasExactKeys(pointer, ['key', 'identity']) || pointer.key !== key || !localPointerIdentity(pointer.identity)) {
+      throw new Error(`local-flow ${name} current pointer identity is invalid`)
+    }
+  }
+  const sameVersion = transaction.mode === 'same-version-2.0.15-exception'
+  const expectedManual = {
+    key: sameVersion ? expectedPointerKeys.manual : `desktop/manual/v${request.version}/latest.json`,
+    write: sameVersion ? 'compare-and-swap' : 'create-only',
+    rollback: sameVersion ? 'restore-by-cas' : 'retain',
+  }
+  if (canonicalJson(transaction.manual_manifest) !== canonicalJson(expectedManual)
+    || canonicalJson(transaction.activation_order) !== canonicalJson(['manual', 'signed', 'legacy'])
+    || canonicalJson(transaction.rollback_order) !== canonicalJson(sameVersion ? ['legacy', 'signed', 'manual'] : ['legacy', 'signed'])
+    || transaction.manual_reinstall_required_for_existing_2_0_15 !== sameVersion
+    || (sameVersion
+      ? request.version !== transaction.current_public_version || request.version !== RELEASE_VERSION
+      : compareStableVersions(request.version, transaction.current_public_version) <= 0)) {
+    throw new Error('local-flow release transaction mode does not match the frozen version')
+  }
+}
+
+function validateLocalManifestRequest(admission) {
+  if (!hasExactKeys(admission, ['owner', 'signed_manifest', 'handoff'])
+    || typeof admission.owner !== 'string'
+    || !admission.owner.startsWith(`${EXPECTED_ACTION_REPOSITORY}@`)
+    || !SHA40.test(admission.owner.slice(EXPECTED_ACTION_REPOSITORY.length + 1))
+    || !hasExactKeys(admission.signed_manifest, [
+      'artifact_path', 'schema_version', 'document_type', 'release_status', 'signing_context', 'signature', 'max_bytes',
+    ]) || admission.signed_manifest.artifact_path !== SIGNED_MANIFEST_FILENAME
+    || admission.signed_manifest.schema_version !== 2
+    || admission.signed_manifest.document_type !== 'emate.desktop-release-manifest'
+    || admission.signed_manifest.release_status !== 'admitted'
+    || admission.signed_manifest.signing_context !== RELEASE_SIGNATURE_CONTEXT.toString('utf8')
+    || !hasExactKeys(admission.signed_manifest.signature, ['algorithm', 'key_source'])
+    || admission.signed_manifest.signature.algorithm !== 'ed25519'
+    || admission.signed_manifest.signature.key_source !== 'existing-base-profile_signing_keys'
+    || admission.signed_manifest.max_bytes !== LEGACY_MANIFEST_MAX_BYTES
+    || !hasExactKeys(admission.handoff, ['status', 'exact_files'])
+    || admission.handoff.status !== 'ready-for-cloudflare-plugin'
+    || canonicalJson(admission.handoff.exact_files) !== canonicalJson([
+      SIGNED_MANIFEST_FILENAME, PUBLICATION_PLAN_FILENAME, CLOUDFLARE_HANDOFF_FILENAME,
+    ])) {
+    throw new Error('local-flow manifest admission request is invalid')
+  }
+}
+
+function validateLocalActivationRequest(activation, transaction) {
+  const pointerNames = transaction.mode === 'new-version' ? ['signed', 'legacy'] : transaction.activation_order
+  const expectedRecovery = {
+    accepted_current_states: ['exact-before', 'exact-after'],
+    already_exact: 'idempotent',
+    stale_etag: 'fail-closed',
+    foreign_state: 'fail-closed',
+    partial_activation: 'resume-ordered-prefix',
+    crash_recovery: 'resume-same-request',
+  }
+  const expectedOrder = [
+    'current-public-three-pointer-readbacks', 'existing-owner-admission-and-ed25519-manifest-signing',
+    'immutable-create-only', 'authenticated-readback', 'public-readback',
+    transaction.mode === 'same-version-2.0.15-exception'
+      ? 'manual-pointer-cas-and-readbacks'
+      : 'manual-manifest-create-only-and-readbacks',
+    'signed-pointer-cas-and-readbacks', 'legacy-pointer-cas-and-readbacks',
+  ]
+  if (!hasExactKeys(activation, [
+    'current_public_pointer_readback', 'manual_manifest', 'pointers', 'activation_order', 'recovery', 'order',
+  ]) || activation.current_public_pointer_readback !== 'required-before-any-write'
+    || canonicalJson(activation.activation_order) !== canonicalJson(transaction.activation_order)
+    || canonicalJson(activation.recovery) !== canonicalJson(expectedRecovery)
+    || canonicalJson(activation.order) !== canonicalJson(expectedOrder)
+    || !hasExactKeys(activation.pointers, pointerNames)
+    || !hasExactKeys(activation.manual_manifest, [
+      'key', 'write', 'rollback', 'expected_current', 'target', 'authenticated_readback', 'public_full_byte_readback',
+    ]) || activation.manual_manifest.key !== transaction.manual_manifest.key
+    || activation.manual_manifest.write !== transaction.manual_manifest.write
+    || activation.manual_manifest.rollback !== transaction.manual_manifest.rollback
+    || activation.manual_manifest.authenticated_readback !== 'required'
+    || activation.manual_manifest.public_full_byte_readback !== 'required'
+    || !localPointerTarget(activation.manual_manifest.target)) {
+    throw new Error('local-flow publication activation request is invalid')
+  }
+  const sameVersion = transaction.mode === 'same-version-2.0.15-exception'
+  if (sameVersion
+    ? canonicalJson(activation.manual_manifest.expected_current)
+      !== canonicalJson(transaction.current_public_pointers.manual.identity)
+    : activation.manual_manifest.expected_current !== 'must-not-exist') {
+    throw new Error('local-flow manual manifest predecessor is invalid')
+  }
+  for (const name of pointerNames) {
+    const pointer = activation.pointers[name]
+    if (!hasExactKeys(pointer, [
+      'key', 'expected_current', 'target', 'compare_and_swap', 'authenticated_readback', 'public_full_byte_readback',
+    ]) || pointer.key !== transaction.current_public_pointers[name].key
+      || canonicalJson(pointer.expected_current) !== canonicalJson(transaction.current_public_pointers[name].identity)
+      || !localPointerTarget(pointer.target) || pointer.compare_and_swap !== 'required'
+      || pointer.authenticated_readback !== 'required' || pointer.public_full_byte_readback !== 'required') {
+      throw new Error(`local-flow ${name} activation pointer is invalid`)
+    }
+  }
+}
+
+function validateLocalImmutableObjects(objects, request) {
+  const primaryArtifacts = {}
+  const names = new Set()
+  for (const object of objects) {
+    if (!hasExactKeys(object, ['platform', 'artifact_path', 'key', 'bytes', 'sha256', 'write'])
+      || !['macos', 'windows'].includes(object.platform) || !positiveInteger(object.bytes)
+      || typeof object.artifact_path !== 'string' || typeof object.key !== 'string'
+      || !SHA256.test(object.sha256 ?? '') || object.write !== 'create-only') {
+      throw new Error('local-flow immutable artifact descriptor is invalid')
+    }
+    const filename = object.platform === 'macos'
+      ? `e-Mate-${request.version}-mac-universal.dmg`
+      : `e-Mate-${request.version}-win-x64-Setup.exe`
+    if (![filename, `${filename}.blockmap`].includes(object.artifact_path.split('/').at(-1))
+      || object.artifact_path !== `artifacts/${object.platform}/${object.artifact_path.split('/').at(-1)}`
+      || object.key !== `desktop/releases/v${request.version}/${request.source_commit}/${object.artifact_path.split('/').at(-1)}`
+      || names.has(object.artifact_path)) {
+      throw new Error('local-flow immutable artifact path or key is invalid')
+    }
+    names.add(object.artifact_path)
+    if (object.artifact_path.endsWith(filename)) {
+      if (primaryArtifacts[object.platform] !== undefined) throw new Error('local-flow repeats a platform installer')
+      primaryArtifacts[object.platform] = object
+    }
+  }
+  if (!hasExactKeys(primaryArtifacts, ['macos', 'windows'])) {
+    throw new Error('local-flow request must bind both platform installers')
+  }
+  return primaryArtifacts
+}
+
+function localPointerIdentity(value) {
+  return hasExactKeys(value, ['bytes', 'sha256', 'etag']) && positiveInteger(value.bytes)
+    && SHA256.test(value.sha256 ?? '') && ETAG.test(value.etag ?? '')
+}
+
+function localPointerTarget(value) {
+  return hasExactKeys(value, ['artifact_path', 'bytes', 'sha256', 'etag'])
+    && value.artifact_path === SIGNED_MANIFEST_FILENAME
+    && value.bytes === 'from-manifest-admission.signed_manifest.bytes'
+    && value.sha256 === 'from-manifest-admission.signed_manifest.sha256'
+    && value.etag === 'from-conditional-write-result.etag'
+}
+
+function hasLocalGithubMetadata(value) {
+  if (Array.isArray(value)) return value.some(hasLocalGithubMetadata)
+  if (!isRecord(value)) return false
+  return Object.entries(value).some(([key, item]) => key === 'github' || key.startsWith('github_')
+    || ['main_ci_run_id', 'macos_signer_run_id', 'admission_artifact_id', 'windows_staging_artifact_id']
+      .includes(key) || hasLocalGithubMetadata(item))
+}
+
+function compareStableVersions(left, right) {
+  const leftParts = left.split('.').map(BigInt)
+  const rightParts = right.split('.').map(BigInt)
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) return leftParts[index] < rightParts[index] ? -1 : 1
+  }
+  return 0
+}
+
+async function exactLocalDirectory(path, label) {
+  if (typeof path !== 'string' || !isAbsolute(path) || resolve(path) !== path) {
+    throw new Error(`${label} path is invalid`)
+  }
+  const metadata = await lstat(path)
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || await realpath(path) !== path) {
+    throw new Error(`${label} must be an exact non-symlink directory`)
+  }
+  return path
+}
+
+async function exactLocalFile(path, expectedPath, root, label) {
+  if (typeof path !== 'string' || !isAbsolute(path) || resolve(path) !== path || path !== expectedPath) {
+    throw new Error(`${label} path drifted`)
+  }
+  const fromRoot = relative(root, path)
+  if (fromRoot === '' || fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    throw new Error(`${label} escaped its admitted root`)
+  }
+  const metadata = await lstat(path)
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || await realpath(path) !== path) {
+    throw new Error(`${label} must be an exact non-symlink regular file`)
+  }
+  return path
+}
+
+async function readStableLocalFile(path, maxBytes, label) {
+  const before = await lstat(path)
+  if (before.size <= 0 || before.size > maxBytes) throw new Error(`${label} is empty or oversized`)
+  const bytes = await readFile(path)
+  const after = await lstat(path)
+  if (!sameLocalFile(before, after) || bytes.byteLength !== before.size) throw new Error(`${label} changed during admission`)
+  return bytes
+}
+
+async function stableLocalFileIdentity(path, label) {
+  const before = await lstat(path)
+  const digest = createHash('sha256')
+  for await (const chunk of createReadStream(path)) digest.update(chunk)
+  const after = await lstat(path)
+  if (!sameLocalFile(before, after)) throw new Error(`${label} changed during admission`)
+  return { bytes: before.size, sha256: digest.digest('hex') }
+}
+
+function sameLocalFile(left, right) {
+  return left.isFile() && right.isFile() && !left.isSymbolicLink() && !right.isSymbolicLink()
+    && left.dev === right.dev && left.ino === right.ino && left.size === right.size
+    && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
 }
 
 function validateInvocation(config) {
