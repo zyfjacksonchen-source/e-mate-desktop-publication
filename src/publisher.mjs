@@ -7,7 +7,7 @@ import {
 } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { lstat, readFile, realpath } from 'node:fs/promises'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
 
 export const EXPECTED_REPOSITORY = 'zyfjacksonchen-source/e-Mate-2.0.11'
 export const EXPECTED_ACTION_REPOSITORY = 'zyfjacksonchen-source/e-mate-desktop-publication'
@@ -25,6 +25,12 @@ export const SIGNED_MANIFEST_FILENAME = 'desktop-release-signed.json'
 export const PUBLICATION_PLAN_FILENAME = 'cloudflare-publication-plan.json'
 export const CLOUDFLARE_HANDOFF_FILENAME = 'cloudflare-plugin-handoff.json'
 const PROFILE_AGGREGATE_CONTEXT = Buffer.from('e-mate-profile-aggregate-v1\0', 'utf8')
+const LOCAL_PROFILE_AGGREGATE_CONTEXT = Buffer.from('e-mate-local-profile-aggregate-v2\0', 'utf8')
+const COMPATIBILITY_WORKFLOW = '.github/workflows/desktop-compatibility-attestation.yml'
+const COMPATIBILITY_JOB = 'Materialize exact R2 bytes for the accepted 2.0.13 schema-2 parser'
+const IMMUTABLE_REQUEST_PATH = 'publication/immutable-owner-request.json'
+const IMMUTABLE_RECEIPT_PATH = 'publication/immutable-owner-receipt.json'
+const COMPATIBILITY_REQUEST_PATH = 'publication/compatibility-attestation-request.json'
 export const DESKTOP_RELEASE_ARTIFACT_NAMES = Object.freeze({
   candidate: 'desktop-candidate.json',
   darwin: `e-Mate-${RELEASE_VERSION}-mac-universal.dmg`,
@@ -418,6 +424,313 @@ export async function admitLocalDesktopCandidate(config) {
   }
 }
 
+/** Sign one exact local-flow release for the accepted schema-2 clients. */
+export async function prepareLocalSchema2DesktopPublication(config, dependencies) {
+  validateLocalSchema2Invocation(config)
+  const runRoot = await exactLocalDirectory(config.runRoot, 'local-flow run root')
+  const owner = `${EXPECTED_ACTION_REPOSITORY}@${config.actionRef}`
+  const immutableInput = await readLocalJsonInput(
+    runRoot, config.immutableRequestPath, IMMUTABLE_REQUEST_PATH,
+    config.immutableRequestSha256, 'immutable publication request',
+  )
+  const immutable = validateImmutablePublicationRequest(immutableInput.value)
+  const immutableReceiptInput = await readLocalJsonInput(
+    runRoot, config.immutableReceiptPath, IMMUTABLE_RECEIPT_PATH,
+    config.immutableReceiptSha256, 'immutable publication receipt',
+  )
+  validateImmutablePublicationReceipt(
+    immutableReceiptInput.value, immutableInput.descriptor.sha256, immutableInput.value, immutable,
+  )
+  const compatibilityInput = await readLocalJsonInput(
+    runRoot, config.compatibilityRequestPath, COMPATIBILITY_REQUEST_PATH,
+    config.compatibilityRequestSha256, 'compatibility attestation request',
+  )
+  const compatibility = validateCompatibilityAttestationRequest(
+    compatibilityInput.value, immutableInput.descriptor, immutableReceiptInput.descriptor, immutable, owner,
+  )
+  const profileInput = await readLocalJsonInput(
+    runRoot, config.profileAggregatePath, undefined,
+    config.profileAggregateSha256, 'Profile component aggregate',
+  )
+  if (basename(config.profileAggregatePath) !== PROFILE_COMPONENT_AGGREGATE_FILENAME) {
+    throw new Error('Profile component aggregate path drifted')
+  }
+  const profile = await validateLocalProfileAggregate(profileInput.value, {
+    runRoot,
+    request: immutableInput,
+    sourceCommit: immutable.sourceCommit,
+    version: immutable.version,
+    signingKeyId: config.signingKeyId,
+  })
+
+  const github = dependencies?.github
+  if (github === undefined) throw new Error('GitHub compatibility evidence client is missing')
+  await validateProtectedMain(github, { sourceCommit: immutable.sourceCommit })
+  const protectedSourceFiles = {}
+  for (const [name, path, expected] of [
+    ['base_contract', 'desktop/e-mate-desktop/base-contract.json', profile.sourceFiles.base],
+    ['component_inventory', 'packages/dsh/profile/component-inventory.json', profile.sourceFiles.inventory],
+  ]) {
+    const bytes = await github.getFile(path, immutable.sourceCommit)
+    if (!Buffer.isBuffer(bytes) || !bytes.equals(expected)) {
+      throw new Error(`protected-main ${name.replaceAll('_', ' ')} drifted from the local Profile ledger`)
+    }
+    protectedSourceFiles[name] = {
+      path,
+      bytes: bytes.byteLength,
+      sha256: sha256(bytes),
+      verification: 'passed',
+    }
+  }
+  const carrierRun = await validateRun(github, config.compatibilityRunId, {
+    path: COMPATIBILITY_WORKFLOW,
+    event: 'workflow_dispatch',
+    sourceCommit: immutable.sourceCommit,
+    jobs: [COMPATIBILITY_JOB],
+    uniqueJobs: true,
+  })
+  const carrierJobs = await github.getRunJobs(config.compatibilityRunId)
+  const carrierJob = carrierJobs.filter(job => job.name === COMPATIBILITY_JOB
+    && job.status === 'completed' && job.conclusion === 'success')
+  if (carrierJob.length !== 1) throw new Error('GitHub compatibility carrier job is not uniquely successful')
+
+  const artifact = await github.getArtifact(config.compatibilityArtifactId)
+  assertArtifactMetadata(artifact, {
+    id: config.compatibilityArtifactId,
+    name: compatibility.workflow.artifact_name,
+    runId: config.compatibilityRunId,
+    sourceCommit: immutable.sourceCommit,
+  })
+  const bundle = await github.downloadArtifact(config.compatibilityArtifactId)
+  assertDownloadedArtifact(bundle, artifact)
+  assertExactFileSet(bundle.files, compatibility.workflow.exact_files)
+  if (typeof bundle.storedEntries !== 'function') {
+    throw new Error('GitHub compatibility carrier has no compression receipt')
+  }
+  const stored = await bundle.storedEntries()
+  if (!(stored instanceof Set)
+    || canonicalJson([...stored].sort()) !== canonicalJson([...compatibility.workflow.exact_files].sort())) {
+    throw new Error('GitHub compatibility carrier is not entirely compression-level-0 stored')
+  }
+
+  const candidate = parsePrettyJson(
+    await readSmall(requiredFile(bundle.files, DESKTOP_RELEASE_ARTIFACT_NAMES.candidate)),
+    'compatibility Desktop artifact candidate',
+  )
+  const artifacts = validateCompatibilityCandidate(candidate, immutable, config.compatibilityRunId)
+  for (const platform of ['darwin', 'win32']) {
+    const source = requiredFile(bundle.files, DESKTOP_RELEASE_ARTIFACT_NAMES[platform])
+    if (source.bytes !== artifacts[platform].bytes || await source.digest() !== artifacts[platform].sha256) {
+      throw new Error(`GitHub compatibility ${platform} installer bytes drifted from canonical R2 identity`)
+    }
+  }
+
+  const signing = validateBaseAndSigningKey(profile.base, {
+    baseContractId: profile.legacy.base_contract_id,
+    scheduleProtocolFloor: candidate.schedule_protocol_floor,
+    signatureKeyId: config.signingKeyId,
+  }, config)
+  const githubArtifactProvenance = {
+    schema_version: 1,
+    document_type: 'emate.github-artifact-provenance',
+    source_commit: immutable.sourceCommit,
+    artifacts: [{
+      role: 'desktop_candidate',
+      name: artifact.name,
+      artifact_id: String(artifact.id),
+      digest: artifact.digest,
+      run_id: String(carrierRun.id),
+      run_attempt: carrierRun.runAttempt,
+    }],
+  }
+  const unsigned = {
+    schema_version: 2,
+    document_type: 'emate.desktop-release-manifest',
+    release_status: 'admitted',
+    version: immutable.version,
+    source_commit: immutable.sourceCommit,
+    base_contract_id: profile.legacy.base_contract_id,
+    schedule_protocol_floor: candidate.schedule_protocol_floor,
+    profile_component_aggregate: profile.legacy.aggregate,
+    github_artifact_provenance: githubArtifactProvenance,
+    artifacts,
+  }
+  validateUnsignedManifest(unsigned, immutable.sourceCommit)
+  const signature = sign(
+    null,
+    Buffer.concat([RELEASE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(unsigned), 'utf8')]),
+    signing.privateKey,
+  )
+  if (!verify(
+    null,
+    Buffer.concat([RELEASE_SIGNATURE_CONTEXT, Buffer.from(canonicalJson(unsigned), 'utf8')]),
+    signing.publicKey,
+    signature,
+  )) throw new Error('signed Desktop manifest self-verification failed')
+  const signedManifest = {
+    ...unsigned,
+    signature: { algorithm: 'ed25519', key_id: config.signingKeyId, value: signature.toString('base64') },
+  }
+  const signedBytes = Buffer.from(`${JSON.stringify(signedManifest, null, 2)}\n`)
+  if (signedBytes.byteLength > LEGACY_MANIFEST_MAX_BYTES) {
+    throw new Error('signed Desktop manifest exceeds the 2.0.12 bootstrap reader limit')
+  }
+  const signedDescriptor = {
+    path: SIGNED_MANIFEST_FILENAME,
+    schema_version: 2,
+    version: immutable.version,
+    base_contract_id: unsigned.base_contract_id,
+    schedule_protocol_floor: unsigned.schedule_protocol_floor,
+    signature_key_id: config.signingKeyId,
+    verification: 'passed',
+    identity_sha256: sha256(Buffer.from(canonicalJson(signedManifest), 'utf8')),
+    bytes: signedBytes.byteLength,
+    sha256: sha256(signedBytes),
+  }
+  const compatibilityReceipt = {
+    status: 'passed',
+    request_sha256: compatibilityInput.descriptor.sha256,
+    repository: EXPECTED_REPOSITORY,
+    workflow: COMPATIBILITY_WORKFLOW,
+    ref: 'refs/heads/main',
+    head_sha: immutable.sourceCommit,
+    run_id: String(carrierRun.id),
+    run_attempt: carrierRun.runAttempt,
+    artifact: {
+      role: 'desktop_candidate',
+      name: artifact.name,
+      artifact_id: String(artifact.id),
+      digest: artifact.digest,
+      exact_files: [...compatibility.workflow.exact_files],
+    },
+  }
+  const inputs = {
+    immutable_request: immutableInput.descriptor,
+    immutable_receipt: immutableReceiptInput.descriptor,
+    compatibility_request: compatibilityInput.descriptor,
+    profile_component_aggregate: profileInput.descriptor,
+  }
+  const githubVerification = {
+    repository: EXPECTED_REPOSITORY,
+    protected_main: { ref: 'refs/heads/main', head_sha: immutable.sourceCommit, verified_current: true },
+    workflow: {
+      path: COMPATIBILITY_WORKFLOW,
+      event: 'workflow_dispatch',
+      status: carrierRun.status,
+      conclusion: carrierRun.conclusion,
+      run_id: String(carrierRun.id),
+      run_attempt: carrierRun.runAttempt,
+      job: { name: COMPATIBILITY_JOB, status: 'completed', conclusion: 'success', unique: true },
+    },
+    artifact: {
+      role: 'desktop_candidate',
+      name: artifact.name,
+      artifact_id: String(artifact.id),
+      digest: artifact.digest,
+      bytes: artifact.bytes,
+      run_id: String(artifact.runId),
+      source_commit: artifact.sourceCommit,
+      expired: artifact.expired,
+      archive: {
+        bytes: bundle.archiveBytes,
+        sha256: bundle.archiveSha256,
+        compression_level_0: true,
+        exact_files: [...compatibility.workflow.exact_files],
+      },
+    },
+  }
+  const profileSigning = {
+    status: 'passed',
+    signature_key_id: config.signingKeyId,
+    protected_source_files: protectedSourceFiles,
+    full_component_aggregate: {
+      ...profileInput.descriptor,
+      aggregate_sha256: profileInput.value.aggregate_sha256,
+      verification: 'passed',
+    },
+    legacy_component_aggregate: profile.legacy.aggregate,
+    verification: {
+      source_version_base: 'passed',
+      local_request_and_ledger: 'passed',
+      inventory_and_profile_tree: 'passed',
+      legacy_projection: 'passed',
+      base_trusted_key: 'passed',
+      manifest_signature: 'passed',
+    },
+  }
+  const dataPlane = {
+    origin: PUBLIC_ORIGIN,
+    installer_download: 'cloudflare-r2-only',
+    online_update: 'cloudflare-r2-only',
+    rollback: 'cloudflare-r2-only',
+    github_role: 'compatibility-attestation-carrier-only',
+    github_built_or_tested_installer_bytes: false,
+  }
+  const plan = {
+    schema_version: 1,
+    document_type: 'emate.local-schema2-signing-plan',
+    status: 'ready-for-main-local-flow-activation',
+    owner,
+    repository: EXPECTED_REPOSITORY,
+    source_commit: immutable.sourceCommit,
+    run_id: immutable.runId,
+    version: immutable.version,
+    data_plane: dataPlane,
+    inputs,
+    compatibility_attestation: compatibilityReceipt,
+    github_verification: githubVerification,
+    profile_signing: profileSigning,
+    signed_manifest: signedDescriptor,
+    next_owner: 'main-local-flow-activation',
+    forbidden_actions: ['build-installers', 'test-installers', 'write-r2', 'activate-pointer', 'serve-user-downloads'],
+  }
+  const planBytes = Buffer.from(`${JSON.stringify(plan, null, 2)}\n`)
+  const handoff = {
+    schema_version: 1,
+    document_type: 'emate.local-schema2-signer-receipt',
+    status: 'passed',
+    owner,
+    repository: EXPECTED_REPOSITORY,
+    source_commit: immutable.sourceCommit,
+    run_id: immutable.runId,
+    version: immutable.version,
+    data_plane: dataPlane,
+    inputs,
+    compatibility_attestation: compatibilityReceipt,
+    github_verification: githubVerification,
+    profile_signing: profileSigning,
+    files: {
+      signed_manifest: signedDescriptor,
+      publication_plan: {
+        path: PUBLICATION_PLAN_FILENAME,
+        bytes: planBytes.byteLength,
+        sha256: sha256(planBytes),
+      },
+    },
+    production_state: {
+      r2_write_performed: false,
+      public_readback_performed: false,
+      active_pointer_changed: false,
+      legacy_pointer_changed: false,
+    },
+    next_owner: 'main-local-flow-activation',
+  }
+  const handoffBytes = Buffer.from(`${JSON.stringify(handoff, null, 2)}\n`)
+  return {
+    artifactName: `e-mate-local-schema2-signer-${immutable.sourceCommit}`,
+    files: new Map([
+      [SIGNED_MANIFEST_FILENAME, bufferSource(signedBytes)],
+      [PUBLICATION_PLAN_FILENAME, bufferSource(planBytes)],
+      [CLOUDFLARE_HANDOFF_FILENAME, bufferSource(handoffBytes)],
+    ]),
+    compatibilityAttestation: compatibilityReceipt,
+    manifestIdentity: signedDescriptor.identity_sha256,
+    manifestSha256: signedDescriptor.sha256,
+    planSha256: sha256(planBytes),
+    handoffSha256: sha256(handoffBytes),
+  }
+}
+
 export async function prepareDesktopPublication(config, dependencies) {
   validateInvocation(config)
   const { github } = dependencies
@@ -709,6 +1022,358 @@ export async function prepareDesktopPublication(config, dependencies) {
     manifestSha256: signedRawSha256,
     planSha256: sha256(publicationPlanBytes),
   }
+}
+
+function validateLocalSchema2Invocation(config) {
+  const keys = [
+    'runRoot', 'immutableRequestPath', 'immutableRequestSha256',
+    'immutableReceiptPath', 'immutableReceiptSha256',
+    'compatibilityRequestPath', 'compatibilityRequestSha256',
+    'profileAggregatePath', 'profileAggregateSha256',
+    'compatibilityRunId', 'compatibilityArtifactId',
+    'actionRepository', 'actionRef', 'signingKeyId', 'privateKeyPem',
+  ]
+  if (process.versions.node.split('.')[0] !== '24') throw new Error('local schema-2 signing requires Node 24')
+  if (!hasExactKeys(config, keys)
+    || config.actionRepository !== EXPECTED_ACTION_REPOSITORY || !SHA40.test(config.actionRef ?? '')
+    || !RUN_ID.test(config.compatibilityRunId ?? '') || !RUN_ID.test(config.compatibilityArtifactId ?? '')
+    || !KEY_ID.test(config.signingKeyId ?? '') || typeof config.privateKeyPem !== 'string'
+    || config.privateKeyPem === ''
+    || ![config.immutableRequestSha256, config.immutableReceiptSha256,
+      config.compatibilityRequestSha256, config.profileAggregateSha256]
+      .every(value => SHA256.test(value ?? ''))) {
+    throw new Error('local schema-2 signing bindings are invalid')
+  }
+}
+
+async function readLocalJsonInput(root, path, expectedRelativePath, expectedSha256, label) {
+  const expectedPath = expectedRelativePath === undefined
+    ? path
+    : resolve(root, ...expectedRelativePath.split('/'))
+  const acceptedPath = await exactLocalFile(path, expectedPath, root, label)
+  const bytes = await readStableLocalFile(acceptedPath, LOCAL_REQUEST_MAX_BYTES, label)
+  const actualSha256 = sha256(bytes)
+  if (actualSha256 !== expectedSha256) throw new Error(`${label} SHA-256 drifted`)
+  const relativePath = relative(root, acceptedPath).split(sep).join('/')
+  if (!safeArtifactPath(relativePath)) throw new Error(`${label} path escaped its admitted root`)
+  return {
+    value: parsePrettyJson(bytes, label),
+    bytes,
+    descriptor: { path: relativePath, bytes: bytes.byteLength, sha256: actualSha256 },
+  }
+}
+
+function validateImmutablePublicationRequest(request) {
+  if (!hasExactKeys(request, [
+    'schema_version', 'document_type', 'operation', 'mode', 'status', 'authority', 'distribution_origin',
+    'release_scope', 'run_id', 'version', 'source_commit', 'transaction_mode',
+    'manual_reinstall_required_for_existing_2_0_15', 'rebuild', 'macos_publication_mode',
+    'installer_security', 'immutable_objects', 'completion', 'delete_objects',
+  ]) || request.schema_version !== 1 || request.document_type !== 'emate.local-cloudflare-owner-request'
+    || request.operation !== 'publish-installers-immutable' || request.mode !== 'apply'
+    || request.status !== 'ready-for-existing-owner' || request.authority !== 'codex-cloudflare-plugin'
+    || request.distribution_origin !== PUBLIC_ORIGIN || request.release_scope !== 'full-installers-immutable-only'
+    || !LOCAL_RUN_ID.test(request.run_id ?? '') || request.version !== RELEASE_VERSION
+    || !SHA40.test(request.source_commit ?? '') || request.run_id.split('-')[1] !== request.source_commit.slice(0, 12)
+    || request.transaction_mode !== 'same-version-2.0.15-exception'
+    || request.manual_reinstall_required_for_existing_2_0_15 !== true || request.rebuild !== false
+    || request.macos_publication_mode !== 'unsigned'
+    || !hasExactKeys(request.installer_security, ['darwin', 'win32'])
+    || !['darwin', 'win32'].every(platform => hasExactKeys(request.installer_security[platform], [
+      'code_signed', 'notarized',
+    ]) && request.installer_security[platform].code_signed === false
+      && request.installer_security[platform].notarized === false)
+    || !Array.isArray(request.immutable_objects) || request.immutable_objects.length !== 2
+    || canonicalJson(request.completion) !== canonicalJson({
+      order: ['immutable-create-only-or-already-exact', 'authenticated-full-byte-readback', 'public-full-byte-readback'],
+      terminal_state: 'immutable-installers-verified',
+      next_request: 'schema-2-compatibility-attestation',
+    })
+    || !Array.isArray(request.delete_objects) || request.delete_objects.length !== 0) {
+    throw new Error('immutable publication request is invalid')
+  }
+  const artifacts = {}
+  for (const [platform, manifestPlatform, name] of [
+    ['macos', 'darwin', DESKTOP_RELEASE_ARTIFACT_NAMES.darwin],
+    ['windows', 'win32', DESKTOP_RELEASE_ARTIFACT_NAMES.win32],
+  ]) {
+    const object = request.immutable_objects.find(item => item?.platform === platform)
+    const key = `desktop/releases/v${RELEASE_VERSION}/${request.source_commit}/${name}`
+    if (!hasExactKeys(object, ['platform', 'artifact_path', 'key', 'bytes', 'sha256', 'write', 'url'])
+      || object.artifact_path !== `artifacts/${platform}/${name}` || object.key !== key
+      || object.url !== `${PUBLIC_ORIGIN}/${key}` || !positiveInteger(object.bytes)
+      || !SHA256.test(object.sha256 ?? '') || object.write !== 'create-only') {
+      throw new Error(`immutable publication ${platform} installer is invalid`)
+    }
+    artifacts[manifestPlatform] = {
+      url: object.url,
+      bytes: object.bytes,
+      sha256: object.sha256,
+      build_source_commit: request.source_commit,
+    }
+  }
+  return { runId: request.run_id, version: request.version, sourceCommit: request.source_commit, artifacts }
+}
+
+function validateImmutablePublicationReceipt(receipt, requestSha256, request, immutable) {
+  if (!hasExactKeys(receipt, [
+    'schema_version', 'document_type', 'operation', 'status', 'authority', 'release_scope',
+    'macos_publication_mode', 'installer_security', 'distribution_origin', 'run_id', 'version',
+    'source_commit', 'transaction_mode', 'request_sha256', 'immutable_objects', 'deleted_objects',
+  ]) || receipt.schema_version !== 1 || receipt.document_type !== 'emate.local-cloudflare-owner-receipt'
+    || receipt.operation !== request.operation || receipt.status !== 'passed' || receipt.authority !== request.authority
+    || receipt.release_scope !== request.release_scope || receipt.macos_publication_mode !== 'unsigned'
+    || canonicalJson(receipt.installer_security) !== canonicalJson(request.installer_security)
+    || receipt.distribution_origin !== PUBLIC_ORIGIN || receipt.run_id !== immutable.runId
+    || receipt.version !== immutable.version || receipt.source_commit !== immutable.sourceCommit
+    || receipt.transaction_mode !== request.transaction_mode || receipt.request_sha256 !== requestSha256
+    || !Array.isArray(receipt.immutable_objects)
+    || receipt.immutable_objects.length !== request.immutable_objects.length
+    || !Array.isArray(receipt.deleted_objects) || receipt.deleted_objects.length !== 0) {
+    throw new Error('immutable publication receipt is invalid')
+  }
+  for (const expected of request.immutable_objects) {
+    const object = receipt.immutable_objects.find(item => item?.key === expected.key)
+    if (!hasExactKeys(object, [
+      'platform', 'key', 'url', 'bytes', 'sha256', 'write', 'authenticated_readback', 'public_full_byte_readback',
+    ]) || object.platform !== expected.platform || object.key !== expected.key || object.url !== expected.url
+      || object.bytes !== expected.bytes || object.sha256 !== expected.sha256
+      || !['created', 'already-exact'].includes(object.write)
+      || canonicalJson(object.authenticated_readback) !== canonicalJson({
+        status: 'passed', bytes: expected.bytes, sha256: expected.sha256,
+      })
+      || canonicalJson(object.public_full_byte_readback) !== canonicalJson({
+        status: 'passed', url: expected.url, bytes: expected.bytes, sha256: expected.sha256,
+      })) throw new Error(`immutable publication receipt drifted: ${expected.key}`)
+  }
+}
+
+function validateCompatibilityAttestationRequest(request, immutableDescriptor, receiptDescriptor, immutable, owner) {
+  if (!hasExactKeys(request, [
+    'schema_version', 'document_type', 'status', 'purpose', 'control_plane', 'data_plane',
+    'run_id', 'version', 'source_commit', 'transaction_mode',
+    'manual_reinstall_required_for_existing_2_0_15', 'immutable_publication', 'workflow', 'inputs',
+    'installers', 'provenance_requirements', 'next_owner', 'forbidden_actions',
+  ]) || request.schema_version !== 1
+    || request.document_type !== 'emate.local-desktop-compatibility-attestation-request'
+    || request.status !== 'ready-for-manual-dispatch' || request.purpose !== 'accepted-2.0.13-schema-2-provenance'
+    || request.control_plane !== 'github-compatibility-attestation-carrier'
+    || canonicalJson(request.data_plane) !== canonicalJson({
+      origin: PUBLIC_ORIGIN,
+      installer_download: 'cloudflare-r2-only',
+      online_update: 'cloudflare-r2-only',
+      rollback: 'cloudflare-r2-only',
+    }) || request.run_id !== immutable.runId || request.version !== immutable.version
+    || request.source_commit !== immutable.sourceCommit
+    || request.transaction_mode !== 'same-version-2.0.15-exception'
+    || request.manual_reinstall_required_for_existing_2_0_15 !== true
+    || canonicalJson(request.immutable_publication) !== canonicalJson({
+      status: 'passed',
+      request: { path: IMMUTABLE_REQUEST_PATH, sha256: immutableDescriptor.sha256 },
+      receipt: { path: IMMUTABLE_RECEIPT_PATH, sha256: receiptDescriptor.sha256 },
+    }) || request.next_owner !== owner
+    || canonicalJson(request.forbidden_actions) !== canonicalJson([
+      'build-installers', 'test-installers', 'sign-manifest', 'write-r2', 'activate-pointer', 'serve-user-downloads',
+    ])) throw new Error('compatibility attestation request is invalid')
+
+  const exactFiles = [...DESKTOP_RELEASE_ARTIFACT_FILES]
+  if (!hasExactKeys(request.workflow, [
+    'repository', 'path', 'event', 'ref', 'required_head', 'required_run_attempt',
+    'artifact_name', 'exact_files', 'semantics',
+  ]) || request.workflow.repository !== EXPECTED_REPOSITORY || request.workflow.path !== COMPATIBILITY_WORKFLOW
+    || request.workflow.event !== 'workflow_dispatch' || request.workflow.ref !== 'refs/heads/main'
+    || request.workflow.required_head !== immutable.sourceCommit || request.workflow.required_run_attempt !== 1
+    || request.workflow.artifact_name !== `e-mate-desktop-release-${immutable.sourceCommit}`
+    || canonicalJson(request.workflow.exact_files) !== canonicalJson(exactFiles)
+    || canonicalJson(request.workflow.semantics) !== canonicalJson({
+      role: 'compatibility-carrier-materialization',
+      legacy_build_run_id: 'actual-github-workflow-run-id',
+      github_built_or_tested_installer_bytes: false,
+      dispatch_performed_by_local_flow: false,
+    })) throw new Error('compatibility attestation workflow contract is invalid')
+
+  const darwin = immutable.artifacts.darwin
+  const win32 = immutable.artifacts.win32
+  if (canonicalJson(request.inputs) !== canonicalJson({
+    source_sha: immutable.sourceCommit,
+    version: immutable.version,
+    macos_bytes: String(darwin.bytes),
+    macos_sha256: darwin.sha256,
+    windows_bytes: String(win32.bytes),
+    windows_sha256: win32.sha256,
+  }) || canonicalJson(request.installers) !== canonicalJson({
+    darwin: { ...darwin, name: DESKTOP_RELEASE_ARTIFACT_NAMES.darwin },
+    win32: { ...win32, name: DESKTOP_RELEASE_ARTIFACT_NAMES.win32 },
+  }) || canonicalJson(request.provenance_requirements) !== canonicalJson({
+    schema_version: 1,
+    document_type: 'emate.github-artifact-provenance',
+    source_commit: immutable.sourceCommit,
+    role: 'desktop_candidate',
+    artifact_name: request.workflow.artifact_name,
+    artifact_id: 'required-from-github-api',
+    archive_digest: 'required-from-github-api',
+    run_id: 'required-from-github-api',
+    run_attempt: 1,
+  })) throw new Error('compatibility attestation installer identity is invalid')
+  return { workflow: request.workflow }
+}
+
+async function readRelativeProfileJson(root, descriptor, expectedPath, label, pretty = true) {
+  if (!hasExactKeys(descriptor, ['path', 'bytes', 'sha256']) || descriptor.path !== expectedPath
+    || !positiveInteger(descriptor.bytes) || !SHA256.test(descriptor.sha256 ?? '')) {
+    throw new Error(`${label} descriptor is invalid`)
+  }
+  const path = await exactLocalFile(
+    resolve(root, ...descriptor.path.split('/')),
+    resolve(root, ...expectedPath.split('/')),
+    root,
+    label,
+  )
+  const bytes = await readStableLocalFile(path, LOCAL_REQUEST_MAX_BYTES, label)
+  if (bytes.byteLength !== descriptor.bytes || sha256(bytes) !== descriptor.sha256) {
+    throw new Error(`${label} drifted`)
+  }
+  return { value: pretty ? parsePrettyJson(bytes, label) : parseJson(bytes, label), bytes }
+}
+
+async function validateLocalProfileAggregate(aggregate, context) {
+  if (!hasExactKeys(aggregate, [
+    'schema_version', 'document_type', 'source_commit', 'release_version', 'base_contract_id',
+    'provenance', 'aggregate_sha256', 'inventory_sha256', 'staged_profile_tree_sha256', 'targets',
+  ]) || aggregate.schema_version !== 2 || aggregate.document_type !== 'emate.profile-component-aggregate'
+    || aggregate.source_commit !== context.sourceCommit || aggregate.release_version !== context.version
+    || !BASE_ID.test(aggregate.base_contract_id ?? '') || !SHA256.test(aggregate.aggregate_sha256 ?? '')
+    || !SHA256.test(aggregate.inventory_sha256 ?? '') || !SHA256.test(aggregate.staged_profile_tree_sha256 ?? '')
+    || !hasExactKeys(aggregate.provenance, ['mode', 'run_id', 'request', 'ledger'])
+    || aggregate.provenance.mode !== 'local-flow' || aggregate.provenance.run_id !== context.request.value.run_id
+    || canonicalJson(aggregate.provenance.request) !== canonicalJson(context.request.descriptor)) {
+    throw new Error('local Profile component aggregate is invalid')
+  }
+  const fullUnsigned = {
+    source_commit: aggregate.source_commit,
+    release_version: aggregate.release_version,
+    base_contract_id: aggregate.base_contract_id,
+    provenance: aggregate.provenance,
+    inventory_sha256: aggregate.inventory_sha256,
+    staged_profile_tree_sha256: aggregate.staged_profile_tree_sha256,
+    targets: aggregate.targets,
+  }
+  if (aggregate.aggregate_sha256 !== sha256(Buffer.concat([
+    LOCAL_PROFILE_AGGREGATE_CONTEXT,
+    Buffer.from(canonicalJson(fullUnsigned), 'utf8'),
+  ]))) throw new Error('local Profile component aggregate digest is invalid')
+
+  const ledgerInput = await readRelativeProfileJson(
+    context.runRoot, aggregate.provenance.ledger, 'manifest-inputs/manifest-inputs.json', 'manifest input ledger',
+  )
+  const ledger = ledgerInput.value
+  if (!hasExactKeys(ledger, [
+    'schema_version', 'document_type', 'run_id', 'version', 'source_commit', 'source_status',
+    'distribution_origin', 'profile_signing', 'client_compatible_provenance', 'targets', 'base_contract',
+    'component_inventory', 'platform_receipts', 'artifact_receipts', 'local_candidate_provenance', 'files',
+  ]) || ledger.schema_version !== 1 || ledger.document_type !== 'emate.local-manifest-input-ledger'
+    || ledger.run_id !== context.request.value.run_id || ledger.version !== context.version
+    || ledger.source_commit !== context.sourceCommit || ledger.source_status !== 'committed-clean'
+    || ledger.distribution_origin !== PUBLIC_ORIGIN || ledger.profile_signing !== 'awaiting-existing-owner'
+    || ledger.client_compatible_provenance !== 'open-existing-owner'
+    || canonicalJson(ledger.targets) !== canonicalJson(TARGETS)
+    || !hasExactKeys(ledger.base_contract, [
+      'path', 'bytes', 'sha256', 'id', 'schedule_protocol_floor', 'harness_commit', 'trusted_signing_key_ids',
+    ]) || ledger.base_contract.path !== 'base-contract.json' || ledger.base_contract.id !== aggregate.base_contract_id
+    || !positiveInteger(ledger.base_contract.schedule_protocol_floor)
+    || !SHA40.test(ledger.base_contract.harness_commit ?? '')
+    || !Array.isArray(ledger.base_contract.trusted_signing_key_ids)
+    || !ledger.base_contract.trusted_signing_key_ids.includes(context.signingKeyId)
+    || !hasExactKeys(ledger.component_inventory, ['path', 'bytes', 'sha256'])
+    || ledger.component_inventory.path !== 'component-inventory.json'
+    || ledger.component_inventory.sha256 !== aggregate.inventory_sha256
+    || !hasExactKeys(ledger.platform_receipts, ['macos', 'windows'])
+    || !Array.isArray(ledger.files)) throw new Error('local Profile manifest input ledger is invalid')
+
+  const profileRoot = resolve(context.runRoot, 'manifest-inputs', 'platforms', 'macos')
+  const baseInput = await readRelativeProfileJson(
+    profileRoot,
+    { path: ledger.base_contract.path, bytes: ledger.base_contract.bytes, sha256: ledger.base_contract.sha256 },
+    'base-contract.json',
+    'manifest input Base contract',
+    false,
+  )
+  const inventoryInput = await readRelativeProfileJson(
+    profileRoot, ledger.component_inventory, 'component-inventory.json', 'manifest input component inventory', false,
+  )
+  const base = baseInput.value
+  if (base.id !== ledger.base_contract.id
+    || base.schedule_protocol_floor !== ledger.base_contract.schedule_protocol_floor
+    || base.harness_commit !== ledger.base_contract.harness_commit
+    || canonicalJson(base.profile_signing_keys?.map(key => key.id))
+      !== canonicalJson(ledger.base_contract.trusted_signing_key_ids)
+    || sha256(inventoryInput.bytes) !== aggregate.inventory_sha256) {
+    throw new Error('local Profile Base or inventory drifted from its ledger')
+  }
+  const platformInput = await readRelativeProfileJson(
+    profileRoot, ledger.platform_receipts.macos, 'platform-inputs.json', 'macOS manifest platform receipt',
+  )
+  const platform = platformInput.value
+  if (platform.schema_version !== 1 || platform.document_type !== 'emate.local-manifest-platform-inputs'
+    || platform.platform !== 'macos' || platform.version !== context.version
+    || platform.source_commit !== context.sourceCommit
+    || canonicalJson(platform.base_contract) !== canonicalJson(ledger.base_contract)
+    || canonicalJson(platform.component_inventory) !== canonicalJson(ledger.component_inventory)
+    || platform.profile_artifact?.sha256 !== aggregate.staged_profile_tree_sha256) {
+    throw new Error('macOS manifest platform receipt does not bind the Profile aggregate')
+  }
+  const profileReceiptInput = await readRelativeProfileJson(
+    profileRoot, platform.profile_build_receipt, 'profile-build-receipt.json', 'macOS Profile build receipt',
+  )
+  const profileReceipt = profileReceiptInput.value
+  if (profileReceipt.schema_version !== 1 || profileReceipt.document_type !== 'emate.desktop-profile-build-receipt'
+    || profileReceipt.source_commit !== context.sourceCommit || profileReceipt.base_contract_id !== aggregate.base_contract_id
+    || profileReceipt.inventory_sha256 !== aggregate.inventory_sha256
+    || profileReceipt.staged_profile_tree_sha256 !== aggregate.staged_profile_tree_sha256) {
+    throw new Error('macOS Profile build receipt does not bind the Profile aggregate')
+  }
+
+  const legacyUnsigned = {
+    inventory_sha256: aggregate.inventory_sha256,
+    staged_profile_tree_sha256: aggregate.staged_profile_tree_sha256,
+    targets: aggregate.targets,
+  }
+  const legacyAggregate = {
+    aggregate_sha256: sha256(Buffer.concat([
+      PROFILE_AGGREGATE_CONTEXT,
+      Buffer.from(canonicalJson(legacyUnsigned), 'utf8'),
+    ])),
+    ...legacyUnsigned,
+  }
+  if (!profileAggregate(legacyAggregate)) throw new Error('legacy Profile aggregate projection is invalid')
+  return {
+    base,
+    sourceFiles: { base: baseInput.bytes, inventory: inventoryInput.bytes },
+    legacy: { base_contract_id: aggregate.base_contract_id, aggregate: legacyAggregate },
+  }
+}
+
+function validateCompatibilityCandidate(candidate, immutable, carrierRunId) {
+  if (!hasExactKeys(candidate, [
+    'schema_version', 'document_type', 'release_status', 'version', 'source_commit',
+    'schedule_protocol_floor', 'artifacts',
+  ]) || candidate.schema_version !== 2 || candidate.document_type !== 'emate.desktop-artifact-candidate'
+    || candidate.release_status !== 'admission-pending' || candidate.version !== immutable.version
+    || candidate.source_commit !== immutable.sourceCommit || !positiveInteger(candidate.schedule_protocol_floor)
+    || !hasExactKeys(candidate.artifacts, ['darwin', 'win32'])) {
+    throw new Error('compatibility Desktop candidate is invalid')
+  }
+  const artifacts = {}
+  for (const platform of ['darwin', 'win32']) {
+    const expected = { ...immutable.artifacts[platform], build_run_id: carrierRunId }
+    if (canonicalJson(candidate.artifacts[platform]) !== canonicalJson(expected)
+      || candidate.artifacts[platform].build_run_id !== carrierRunId
+      || candidate.artifacts[platform].url.startsWith('https://github.com/')) {
+      throw new Error(`compatibility Desktop candidate ${platform} identity drifted from canonical R2`)
+    }
+    artifacts[platform] = expected
+  }
+  return artifacts
 }
 
 function validateLocalPublicationRequest(request) {
